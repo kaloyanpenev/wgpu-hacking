@@ -129,7 +129,7 @@ var<storage, read_write> vbos: array<Vertex>; // write the verts
 var<storage, read> v_entities: array<Entity>; // read the model so we can take into account where it is in the future - would need to compare pos to wind texture
 
 @compute
-@workgroup_size(1)
+@workgroup_size(128, 1, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    vbos[0].pos = vec4(0.0, 0.0, 2.0, 0.0);
+    vbos[30].pos = vbos[0].pos + vec4(0.0, 0.0, 2.0, 0.0);
 }

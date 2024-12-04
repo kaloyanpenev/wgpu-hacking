@@ -2,6 +2,7 @@ use std::{f32::consts, iter, mem::size_of, ops::Range, sync::Arc};
 use std::ops::Deref;
 use bytemuck::{Pod, Zeroable};
 use glam::EulerRot;
+use wgpu::{Features, PolygonMode};
 use wgpu::util::{align_to, DeviceExt};
 
 #[repr(C)]
@@ -132,6 +133,7 @@ struct Entity {
     mx_world: glam::Mat4,
     rotation_speed: f32,
     color: wgpu::Color,
+    const_vertex_buf: wgpu::Buffer,
     vertex_buf: wgpu::Buffer,
     index_buf: Arc<wgpu::Buffer>,
     index_format: wgpu::IndexFormat,
@@ -208,8 +210,7 @@ struct ComputePass {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     storage_buf: wgpu::Buffer,
-    vertex_size_alignment: wgpu::BufferAddress,
-    grass_vbo: Vec<Vertex>,
+    vertex_size: wgpu::BufferAddress,
 }
 
 struct Example {
@@ -227,8 +228,7 @@ struct Example {
 
 impl Example {
     const MAX_LIGHTS: usize = 10;
-    const VERTS_PER_GRASSBLADE : u8 = 18; // needs to be an even number - this is 8 steps
-    const MAX_GRASSBLADES : u8 = 10;
+    const VERTS_PER_GRASSBLADE : u16 = 128; // needs to be an even number, using compute shader for now
     const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
     const SHADOW_SIZE: wgpu::Extent3d = wgpu::Extent3d {
         width: 512,
@@ -274,6 +274,10 @@ impl crate::framework::Example for Example {
     fn required_limits() -> wgpu::Limits {
         wgpu::Limits::downlevel_defaults() // These downlevel limits will allow the code to run on all possible hardware
     }
+
+    fn required_features() -> Features {
+        wgpu::Features::POLYGON_MODE_LINE
+    }
     fn optional_features() -> wgpu::Features {
         wgpu::Features::DEPTH_CLIP_CONTROL
     }
@@ -291,9 +295,11 @@ impl crate::framework::Example for Example {
             && device.limits().max_storage_buffers_per_shader_stage > 0;
 
         // Create the vertex and index buffers
-        let vertex_size = size_of::<Vertex>();
+        let vertex_size = size_of::<Vertex>()  as wgpu::BufferAddress;
+        let vbo_size =
+            vertex_size * Self::VERTS_PER_GRASSBLADE as wgpu::BufferAddress;
         // NOTE KP: JANK HARDCODE, FIX STEP CALCULATION WRT VERTS PER GRASSBLADE LATER
-        let (cube_vertex_data, cube_index_data) = create_grass_blade(0.5, 2.0, (Self::VERTS_PER_GRASSBLADE as u16 / 2) - 1);
+        let (vbo_vertex_data, cube_index_data) = create_grass_blade(0.5, 2.0, (Self::VERTS_PER_GRASSBLADE as u16 / 2) - 1);
 
 
         let cube_index_buf = Arc::new(device.create_buffer_init(
@@ -305,11 +311,15 @@ impl crate::framework::Example for Example {
         ));
 
         let (plane_vertex_data, plane_index_data) = create_plane(7);
-        let plane_vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+
+        let plane_vertex_desc = wgpu::util::BufferInitDescriptor {
             label: Some("Plane Vertex Buffer"),
             contents: bytemuck::cast_slice(&plane_vertex_data),
             usage: wgpu::BufferUsages::VERTEX,
-        });
+        };
+        let plane_vertex_buf = device.create_buffer_init(&plane_vertex_desc);
+        let const_plane_vertex_buf = device.create_buffer_init(&plane_vertex_desc);
+
 
         let plane_index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Plane Index Buffer"),
@@ -374,6 +384,7 @@ impl crate::framework::Example for Example {
                 mx_world: glam::Mat4::IDENTITY,
                 rotation_speed: 0.0,
                 color: wgpu::Color::WHITE,
+                const_vertex_buf: const_plane_vertex_buf,
                 vertex_buf: plane_vertex_buf,
                 index_buf: Arc::new(plane_index_buf),
                 index_format,
@@ -392,8 +403,17 @@ impl crate::framework::Example for Example {
             let cube_vertex_buf = device.create_buffer_init(
                 &wgpu::util::BufferInitDescriptor {
                     label: Some(format!("Cubes Vertex Buffer {i}").as_str()),
-                    contents: bytemuck::cast_slice(&cube_vertex_data),
+                    contents: bytemuck::cast_slice(&vbo_vertex_data),
+                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                },
+            );
+
+            let runtime_vertex_buf = device.create_buffer(
+                &wgpu::BufferDescriptor {
+                    label: Some(format!("Runtime Vertex Buffer {i}").as_str()),
+                    size: vbo_size,
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
                 },
             );
 
@@ -401,7 +421,8 @@ impl crate::framework::Example for Example {
                 mx_world,
                 rotation_speed: cube.rotation,
                 color: wgpu::Color::GREEN,
-                vertex_buf: cube_vertex_buf,
+                const_vertex_buf: cube_vertex_buf,
+                vertex_buf: runtime_vertex_buf,
                 index_buf: Arc::clone(&cube_index_buf),
                 index_format,
                 index_count: cube_index_data.len(),
@@ -516,7 +537,7 @@ impl crate::framework::Example for Example {
 
         let vertex_attr = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
         let vb_desc = wgpu::VertexBufferLayout {
-            array_stride: vertex_size as wgpu::BufferAddress,
+            array_stride: vertex_size,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &vertex_attr,
         };
@@ -538,7 +559,6 @@ impl crate::framework::Example for Example {
 
         let compute_pass = {
             let uniform_size = size_of::<GlobalUniforms>() as wgpu::BufferAddress;
-            let vertSize = size_of::<Vertex>()  as wgpu::BufferAddress;
 
             // Create pipeline layout
             let bind_group_layout =
@@ -560,7 +580,7 @@ impl crate::framework::Example for Example {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(vertSize)
+                            min_binding_size: wgpu::BufferSize::new(vertex_size)
                         },
                         count: None,
                     },
@@ -582,8 +602,9 @@ impl crate::framework::Example for Example {
             });
 
             // we need to allocate: model + color + vertex buffer (calculated as vertex * vert per grassblade) for each grass blade
+
             let grass_vbo_buffer_size =
-                vertex_size as wgpu::BufferAddress * Self::VERTS_PER_GRASSBLADE as wgpu::BufferAddress * Self::MAX_GRASSBLADES as wgpu::BufferAddress;
+                vbo_size * cube_descs.len() as wgpu::BufferAddress;
             let grass_vbo_storage_buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Grass VBO"),
                 size: grass_vbo_buffer_size,
@@ -622,8 +643,7 @@ impl crate::framework::Example for Example {
                 pipeline,
                 bind_group,
                 storage_buf: grass_vbo_storage_buf,
-                vertex_size_alignment: vertex_size as wgpu::BufferAddress,
-                grass_vbo: cube_vertex_data
+                vertex_size: vertex_size,
             }
         };
 
@@ -814,6 +834,7 @@ impl crate::framework::Example for Example {
                 primitive: wgpu::PrimitiveState {
                     front_face: wgpu::FrontFace::Ccw,
                     cull_mode: None,
+                    polygon_mode: PolygonMode::Line,
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -916,7 +937,7 @@ impl crate::framework::Example for Example {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-
+        let vbo_size = self.compute_pass.vertex_size as u64 * Self::VERTS_PER_GRASSBLADE as u64;
 
         // copy entities VBOs into compute storage
         {
@@ -926,9 +947,8 @@ impl crate::framework::Example for Example {
                     continue;
                 }
 
-                let vbo_size = self.compute_pass.vertex_size_alignment as u64 * Self::VERTS_PER_GRASSBLADE as u64;
                 encoder.copy_buffer_to_buffer(
-                    &entity.vertex_buf,
+                    &entity.const_vertex_buf,
                     0,
                     &self.compute_pass.storage_buf,
                     ((i - 1) as u64 * vbo_size) as wgpu::BufferAddress, // jank to ignore the plane
@@ -946,10 +966,10 @@ impl crate::framework::Example for Example {
             cpass.set_pipeline(&self.compute_pass.pipeline);
             cpass.set_bind_group(0, &self.compute_pass.bind_group, &[]);
             cpass.insert_debug_marker("compute grass beziers");
-            cpass.dispatch_workgroups(self.entities.len() as u32, 1, 1); // Number of cells to run, the (x,y,z) size of item being processed
+            cpass.dispatch_workgroups(1, 1, 1); // Number of cells to run, the (x,y,z) size of item being processed
         }
         encoder.pop_debug_group();
-        // copy back to vertex buffer
+        // copy into the runtime vertex buffer
         {
             for (i, entity) in self.entities.iter().enumerate() {
                 if (i == 0) // jank to ignore the plane
@@ -957,7 +977,6 @@ impl crate::framework::Example for Example {
                     continue;
                 }
 
-                let vbo_size = self.compute_pass.vertex_size_alignment as u64 * Self::VERTS_PER_GRASSBLADE as u64;
                 encoder.copy_buffer_to_buffer(
                     &self.compute_pass.storage_buf,
                     ((i - 1) as u64 * vbo_size) as wgpu::BufferAddress, // jank to ignore the plane
