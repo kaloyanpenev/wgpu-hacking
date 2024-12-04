@@ -17,7 +17,7 @@ struct Entity {
 var<uniform> u_entity: Entity;
 
 @vertex
-fn vs_bake(@location(0) position: vec4<i32>) -> @builtin(position) vec4<f32> {
+fn vs_bake(@location(0) position: vec4<f32>) -> @builtin(position) vec4<f32> {
     return u_globals.view_proj * u_entity.world * vec4<f32>(position);
 }
 
@@ -29,8 +29,8 @@ struct VertexOutput {
 
 @vertex
 fn vs_main(
-    @location(0) position: vec4<i32>,
-    @location(1) normal: vec4<i32>,
+    @location(0) position: vec4<f32>,
+    @location(1) normal: vec4<f32>,
 ) -> VertexOutput {
     let w = u_entity.world;
     let world_pos = u_entity.world * vec4<f32>(position);

@@ -101,6 +101,9 @@ async fn execute_gpu_inner(
 
     // A pipeline specifies the operation of a shader
 
+    let cs_module = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+
+
     // Instantiates the pipeline.
     let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,

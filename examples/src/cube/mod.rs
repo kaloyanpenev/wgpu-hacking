@@ -16,6 +16,14 @@ fn vertex(pos: [i8; 3], tc: [i8; 2]) -> Vertex {
     }
 }
 
+fn grassVertex(pos: [f32; 3], normal: [f32; 3]) -> Vertex {
+    Vertex {
+        _pos: [pos[0], pos[1], pos[2], 1.0],
+        _tex_coord: [0.0, 1.0],
+    }
+}
+
+
 fn create_vertices() -> (Vec<Vertex>, Vec<u16>) {
     let vertex_data = [
         // top (0, 0, 1)
@@ -62,6 +70,53 @@ fn create_vertices() -> (Vec<Vertex>, Vec<u16>) {
     (vertex_data.to_vec(), index_data.to_vec())
 }
 
+fn create_grass_blade(baseWidth: f32, height: f32, steps: i8) -> (Vec<Vertex>, Vec<u16>) {
+    let mut vertex_data : Vec<Vertex> = vec![];
+    let mut index_data : Vec<u16> = vec![];
+
+    let steps = steps.max(2);
+    // all the steps
+
+    let baseWidthVec = glam::vec3(baseWidth * 0.5, 0.0, 0.0);
+    let heightVec = glam::vec3(0.0, height, 0.0);
+
+    for i in (1..=steps) {
+
+        // calculate w.r.t. steps rather than quadSteps so we know how much to add for the final triangle
+        let lastPoint = baseWidthVec.lerp(heightVec, (i - 1) as f32 / steps as f32); // lerp + center around 0 with 0.5*
+        let newPoint = baseWidthVec.lerp(heightVec, i as f32 / steps as f32); // lerp + center around 0 with 0.5*
+
+        let normal: [f32; 3] = [0.0, 0.0, 1.0];
+
+        // we want to order data such that in a pack of 4, the vertices at the top are always at the end
+        if (i < steps)
+        {
+            vertex_data.push(grassVertex([-lastPoint.x, lastPoint.y, 0.0], normal.clone()));
+            vertex_data.push(grassVertex([lastPoint.x, lastPoint.y, 0.0], normal.clone()));
+            vertex_data.push(grassVertex([newPoint.x, newPoint.y, 0.0], normal.clone()));
+            vertex_data.push(grassVertex([-newPoint.x, newPoint.y, 0.0], normal.clone()));
+
+            let this_index_data: &[u16] = &[0, 1, 2, 2, 3, 0].map(|x : u16| { x + (i as u16 * 4) });
+            index_data.append(this_index_data.to_vec().as_mut());
+        }
+        else
+        {
+            // last step
+            vertex_data.push(grassVertex([-lastPoint.x, lastPoint.y, 0.0], normal.clone()));
+            vertex_data.push(grassVertex([lastPoint.x, lastPoint.y, 0.0], normal.clone()));
+            vertex_data.push(grassVertex([0.0, newPoint.y, 0.0], normal.clone()));
+            vertex_data.push(grassVertex([0.0, newPoint.y, 0.0], normal.clone()));
+
+            let this_index_data: &[u16] = &[0, 1, 2].map(|x : u16| { x + (i as u16 * 4) });
+            index_data.append(this_index_data.to_vec().as_mut());
+        }
+
+    }
+
+
+    (vertex_data, index_data)
+}
+
 fn create_texels(size: usize) -> Vec<u8> {
     (0..size * size)
         .map(|id| {
@@ -94,7 +149,7 @@ impl Example {
     fn generate_matrix(aspect_ratio: f32) -> glam::Mat4 {
         let projection = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect_ratio, 1.0, 10.0);
         let view = glam::Mat4::look_at_rh(
-            glam::Vec3::new(1.5f32, -5.0, 3.0),
+            glam::Vec3::new(0.0f32, 9.0, 2.0),
             glam::Vec3::ZERO,
             glam::Vec3::Z,
         );
@@ -115,7 +170,7 @@ impl crate::framework::Example for Example {
     ) -> Self {
         // Create the vertex and index buffers
         let vertex_size = size_of::<Vertex>();
-        let (vertex_data, index_data) = create_vertices();
+        let (vertex_data, index_data) = create_grass_blade(2.0, 5.0, 3);
 
         let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),

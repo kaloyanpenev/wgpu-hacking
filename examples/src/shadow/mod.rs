@@ -1,21 +1,30 @@
 use std::{f32::consts, iter, mem::size_of, ops::Range, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
+use glam::EulerRot;
 use wgpu::util::{align_to, DeviceExt};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
-    _pos: [i8; 4],
-    _normal: [i8; 4],
+    _pos: [f32; 4],
+    _normal: [f32; 4],
 }
 
 fn vertex(pos: [i8; 3], nor: [i8; 3]) -> Vertex {
     Vertex {
-        _pos: [pos[0], pos[1], pos[2], 1],
-        _normal: [nor[0], nor[1], nor[2], 0],
+        _pos: [pos[0] as f32, pos[1] as f32, pos[2] as f32, 1.0],
+        _normal: [nor[0] as f32, nor[1] as f32, nor[2] as f32, 0.0],
     }
 }
+
+fn vertexf(pos: [f32; 3], nor: [f32; 3]) -> Vertex {
+    Vertex {
+        _pos: [pos[0], pos[1], pos[2], 1.0],
+        _normal: [nor[0], nor[1], nor[2], 0.0],
+    }
+}
+
 
 fn create_cube() -> (Vec<Vertex>, Vec<u16>) {
     let vertex_data = [
@@ -75,6 +84,51 @@ fn create_plane(size: i8) -> (Vec<Vertex>, Vec<u16>) {
 
     (vertex_data.to_vec(), index_data.to_vec())
 }
+
+fn create_grass_blade(baseWidth: f32, height: f32, steps: u16) -> (Vec<Vertex>, Vec<u16>) {
+    let mut vertex_data : Vec<Vertex> = vec![];
+    let mut index_data : Vec<u16> = vec![];
+
+    let steps = steps.max(2);
+    // all the steps
+
+    let baseWidthVec = glam::vec3(baseWidth * 0.5, 0.0, 0.0); // halved to centre around 0.0
+    let heightVec = glam::vec3(0.0, height, 0.0);
+
+    let normal: [f32; 3] = [0.0, 0.0, 1.0];
+
+    // first step
+    vertex_data.push(vertexf([baseWidth, 0.0, 0.0], normal.clone()));
+    vertex_data.push(vertexf([-baseWidth, 0.0, 0.0], normal.clone()));
+
+    for i in (1..=steps) {
+
+        // calculate w.r.t. steps rather than quadSteps so we know how much to add for the final triangle
+        let newPoint = baseWidthVec.lerp(heightVec, i as f32 / steps as f32);
+
+        // we want to order data such that in a pack of 4, the vertices at the top are always at the end
+        if (i < steps)
+        {
+            vertex_data.push(vertexf([newPoint.x, newPoint.y, 0.0], normal.clone()));
+            vertex_data.push(vertexf([-newPoint.x, newPoint.y, 0.0], normal.clone()));
+
+            index_data.append([1, 0, 2, 2, 1, 3].map(|x| { x + (2 * (i - 1)) }).to_vec().as_mut());
+        }
+        else
+        {
+            // last step
+            vertex_data.push(vertexf([0.0, newPoint.y, 0.0], normal.clone()));
+            vertex_data.push(vertexf([0.0, newPoint.y, 0.0], normal.clone()));
+
+            index_data.append([1, 0, 2].map(|x| { x + 2 * (i - 1) }).to_vec().as_mut());
+        }
+
+    }
+
+
+    (vertex_data, index_data)
+}
+
 
 struct Entity {
     mx_world: glam::Mat4,
@@ -220,7 +274,7 @@ impl crate::framework::Example for Example {
 
         // Create the vertex and index buffers
         let vertex_size = size_of::<Vertex>();
-        let (cube_vertex_data, cube_index_data) = create_cube();
+        let (cube_vertex_data, cube_index_data) = create_grass_blade(0.5, 2.0, 8);
         let cube_vertex_buf = Arc::new(device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Cubes Vertex Buffer"),
@@ -261,25 +315,25 @@ impl crate::framework::Example for Example {
                 offset: glam::Vec3::new(-2.0, -2.0, 2.0),
                 angle: 10.0,
                 scale: 0.7,
-                rotation: 0.1,
+                rotation: 0.0,
             },
             CubeDesc {
                 offset: glam::Vec3::new(2.0, -2.0, 2.0),
                 angle: 50.0,
                 scale: 1.3,
-                rotation: 0.2,
+                rotation: 0.0,
             },
             CubeDesc {
                 offset: glam::Vec3::new(-2.0, 2.0, 2.0),
                 angle: 140.0,
                 scale: 1.1,
-                rotation: 0.3,
+                rotation: 0.0,
             },
             CubeDesc {
                 offset: glam::Vec3::new(2.0, 2.0, 2.0),
                 angle: 210.0,
                 scale: 0.9,
-                rotation: 0.4,
+                rotation: 0.0,
             },
         ];
 
@@ -317,10 +371,7 @@ impl crate::framework::Example for Example {
         for (i, cube) in cube_descs.iter().enumerate() {
             let mx_world = glam::Mat4::from_scale_rotation_translation(
                 glam::Vec3::splat(cube.scale),
-                glam::Quat::from_axis_angle(
-                    cube.offset.normalize(),
-                    cube.angle * consts::PI / 180.,
-                ),
+                glam::Quat::from_euler(EulerRot::XYZ, consts::PI / 2.0, consts::PI / 4.0, 0.0),
                 cube.offset,
             );
             entities.push(Entity {
@@ -440,7 +491,7 @@ impl crate::framework::Example for Example {
             mapped_at_creation: false,
         });
 
-        let vertex_attr = wgpu::vertex_attr_array![0 => Sint8x4, 1 => Sint8x4];
+        let vertex_attr = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
         let vb_desc = wgpu::VertexBufferLayout {
             array_stride: vertex_size as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
