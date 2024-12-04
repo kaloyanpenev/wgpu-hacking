@@ -114,7 +114,22 @@ fn fs_main_without_storage(vertex: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(color, 1.0) * u_entity.color;
 }
 
+struct Vertex
+{
+    pos: vec4<f32>,
+    normal: vec4<f32>
+}
+
+
+@group(0)
+@binding(1)
+var<storage, read_write> vbos: array<Vertex>; // write the verts
+@group(0)
+@binding(2)
+var<storage, read> v_entities: array<Entity>; // read the model so we can take into account where it is in the future - would need to compare pos to wind texture
+
 @compute
 @workgroup_size(1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    vbos[0].pos = vec4(0.0, 0.0, 2.0, 0.0);
 }
