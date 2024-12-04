@@ -228,7 +228,7 @@ struct Example {
 
 impl Example {
     const MAX_LIGHTS: usize = 10;
-    const VERTS_PER_GRASSBLADE : u16 = 128; // needs to be an even number, using compute shader for now
+    const VERTS_PER_GRASSBLADE : u16 = 128; // needs to be an even number, using 2x compute shader workgroup size for now so we can do 1 grass blade per invocation
     const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
     const SHADOW_SIZE: wgpu::Extent3d = wgpu::Extent3d {
         width: 512,
@@ -834,7 +834,7 @@ impl crate::framework::Example for Example {
                 primitive: wgpu::PrimitiveState {
                     front_face: wgpu::FrontFace::Ccw,
                     cull_mode: None,
-                    polygon_mode: PolygonMode::Line,
+                    //polygon_mode: PolygonMode::Line,
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -966,7 +966,7 @@ impl crate::framework::Example for Example {
             cpass.set_pipeline(&self.compute_pass.pipeline);
             cpass.set_bind_group(0, &self.compute_pass.bind_group, &[]);
             cpass.insert_debug_marker("compute grass beziers");
-            cpass.dispatch_workgroups(1, 1, 1); // Number of cells to run, the (x,y,z) size of item being processed
+            cpass.dispatch_workgroups(self.entities.len() as u32 - 1, 1, 1); // Number of cells to run, the (x,y,z) size of item being processed
         }
         encoder.pop_debug_group();
         // copy into the runtime vertex buffer

@@ -129,7 +129,33 @@ var<storage, read_write> vbos: array<Vertex>; // write the verts
 var<storage, read> v_entities: array<Entity>; // read the model so we can take into account where it is in the future - would need to compare pos to wind texture
 
 @compute
-@workgroup_size(128, 1, 1)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    vbos[30].pos = vbos[0].pos + vec4(0.0, 0.0, 2.0, 0.0);
+@workgroup_size(64, 1, 1)
+fn main(@builtin(local_invocation_id) local_id: vec3<u32>,
+        @builtin(global_invocation_id) global_id: vec3<u32>) {
+    // based on https://www.desmos.com/calculator/d1ofwre0fr
+    var p0 = vec2(0.0, 0.0);
+    var p1 = vec2(0.0, 0.8);
+    var p2 = vec2(0.0, 1.0);
+    var p3 = vec2(2.0, 1.0);
+
+    var t : f32 = f32(local_id.x) / 64.0;
+
+    var bezier_eval_0x = ((1-t) * (1-t) * (1-t) * p0.x + t * p1.x);
+    var bezier_eval_1x = t* ((1-t)*p1.x + t * p2.x);
+    var bezier_eval_2x = t* ((1-t) * (1-t) * p1.x + t * p2.x);
+    var bezier_eval_3x = t* ((1-t) * p2.x + t * p3.x);
+    var bezier_x = bezier_eval_0x + bezier_eval_1x + bezier_eval_2x + bezier_eval_3x;
+
+    var bezier_eval_0y = ((1-t) * (1-t) * p0.y + t * p1.y);
+    var bezier_eval_1y = t* ((1-t)*p1.y + t * p2.y);
+    var bezier_eval_2y = t* ((1-t) * (1-t) * p1.y + t * p2.y);
+    var bezier_eval_3y = t* ((1-t) * p2.y + t * p3.y);
+    var bezier_y = (1-t) * (bezier_eval_0y + bezier_eval_1y + bezier_eval_2y + bezier_eval_3y);
+
+    // bezier x is towards normal (along z)
+    // bezier y is up, along y
+    var thid : u32 = global_id.x * 2;
+    var vertex_offset : vec4<f32> = bezier_x * -vec4(1.0, 0.0, 1.0, 0.0);
+    vbos[thid].pos = vbos[thid].pos + vertex_offset;
+    vbos[thid + 1].pos = vbos[thid + 1].pos + vertex_offset;
 }
