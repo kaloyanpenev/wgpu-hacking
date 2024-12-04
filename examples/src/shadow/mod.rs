@@ -98,12 +98,11 @@ fn create_grass_blade(baseWidth: f32, height: f32, steps: u16) -> (Vec<Vertex>, 
     let normal: [f32; 3] = [0.0, 0.0, 1.0];
 
     // first step
-    vertex_data.push(vertexf([baseWidth, 0.0, 0.0], normal.clone()));
-    vertex_data.push(vertexf([-baseWidth, 0.0, 0.0], normal.clone()));
+    vertex_data.push(vertexf([baseWidthVec.x, 0.0, 0.0], normal.clone()));
+    vertex_data.push(vertexf([-baseWidthVec.x, 0.0, 0.0], normal.clone()));
 
     for i in (1..=steps) {
 
-        // calculate w.r.t. steps rather than quadSteps so we know how much to add for the final triangle
         let newPoint = baseWidthVec.lerp(heightVec, i as f32 / steps as f32);
 
         // we want to order data such that in a pack of 4, the vertices at the top are always at the end
@@ -112,7 +111,7 @@ fn create_grass_blade(baseWidth: f32, height: f32, steps: u16) -> (Vec<Vertex>, 
             vertex_data.push(vertexf([newPoint.x, newPoint.y, 0.0], normal.clone()));
             vertex_data.push(vertexf([-newPoint.x, newPoint.y, 0.0], normal.clone()));
 
-            index_data.append([1, 0, 2, 2, 1, 3].map(|x| { x + (2 * (i - 1)) }).to_vec().as_mut());
+            index_data.append([1, 0, 2, 2, 3, 1].map(|x| { x + (2 * (i - 1)) }).to_vec().as_mut());
         }
         else
         {
@@ -194,10 +193,28 @@ struct EntityUniforms {
     color: [f32; 4],
 }
 
+struct EntityVBO
+{
+    vbo: Vec<Vertex>,
+    uniforms: EntityUniforms,
+}
+// All the entities
+// #[repr(C)]
+// #[derive(Clone, Pod, Zeroable)]
+// struct EntityBuffer {
+//     entities: Vec<EntityUniforms>,
+// }
+
 struct Pass {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
+}
+
+struct ComputePass {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    storage_vbo_buf: wgpu::Buffer,
 }
 
 struct Example {
@@ -214,6 +231,8 @@ struct Example {
 
 impl Example {
     const MAX_LIGHTS: usize = 10;
+    const VERTS_PER_GRASSBLADE : u8 = 16; // needs to be an even number - this is 4 steps
+    const MAX_GRASSBLADES : u8 = 10;
     const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
     const SHADOW_SIZE: wgpu::Extent3d = wgpu::Extent3d {
         width: 512,
@@ -256,6 +275,9 @@ impl Example {
 }
 
 impl crate::framework::Example for Example {
+    fn required_limits() -> wgpu::Limits {
+        wgpu::Limits::downlevel_defaults() // These downlevel limits will allow the code to run on all possible hardware
+    }
     fn optional_features() -> wgpu::Features {
         wgpu::Features::DEPTH_CLIP_CONTROL
     }
@@ -274,12 +296,12 @@ impl crate::framework::Example for Example {
 
         // Create the vertex and index buffers
         let vertex_size = size_of::<Vertex>();
-        let (cube_vertex_data, cube_index_data) = create_grass_blade(0.5, 2.0, 8);
+        let (cube_vertex_data, cube_index_data) = create_grass_blade(0.5, 2.0, (Self::VERTS_PER_GRASSBLADE as u16 - 1) / 2);
         let cube_vertex_buf = Arc::new(device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Cubes Vertex Buffer"),
                 contents: bytemuck::cast_slice(&cube_vertex_data),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
             },
         ));
 
@@ -346,10 +368,11 @@ impl crate::framework::Example for Example {
             align_to(entity_uniform_size, alignment)
         };
         // Note: dynamic uniform offsets also have to be aligned to `Limits::min_uniform_buffer_offset_alignment`.
+        // Note KP: We will use this buffer for both storage and dynamic offset binding!
         let entity_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: num_entities * uniform_alignment,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -386,7 +409,7 @@ impl crate::framework::Example for Example {
             });
         }
 
-        let local_bind_group_layout =
+        let entity_mx_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -401,7 +424,7 @@ impl crate::framework::Example for Example {
                 label: None,
             });
         let entity_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &local_bind_group_layout,
+            layout: &entity_mx_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -500,6 +523,116 @@ impl crate::framework::Example for Example {
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
+
+        let mx_total = Self::generate_matrix(config.width as f32 / config.height as f32);
+        let forward_uniforms = GlobalUniforms {
+            proj: mx_total.to_cols_array_2d(),
+            num_lights: [lights.len() as u32, 0, 0, 0],
+        };
+
+        let view_proj_globals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Uniform Buffer"),
+            contents: bytemuck::bytes_of(&forward_uniforms),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+
+        let vertSize = size_of::<Vertex>()  as wgpu::BufferAddress;
+        let vertex_size_alignment = {
+            let alignment =
+                device.limits().min_uniform_buffer_offset_alignment as wgpu::BufferAddress;
+            align_to(vertSize as wgpu::BufferAddress, alignment)
+        };
+
+        // we need to allocate: model + color + vertex buffer (calculated as vertex * vert per grassblade) for each grass blade
+        let grass_vbo_buffer_size =
+            vertex_size_alignment *  Self::VERTS_PER_GRASSBLADE as wgpu::BufferAddress * Self::MAX_GRASSBLADES as wgpu::BufferAddress;
+
+        let grass_vbo_storage_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Grass Buffer"),
+            contents: bytemuck::bytes_of(&forward_uniforms),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+
+        let compute_pass = {
+            let uniform_size = size_of::<GlobalUniforms>() as wgpu::BufferAddress;
+
+            // Create pipeline layout
+            let bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0, // global
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(uniform_size),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1, // vbo storage
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(vertSize)
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2, // uniforms storage
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(entity_uniform_size)
+                        },
+                        count: None,
+                    }],
+                });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("shadow"),
+                bind_group_layouts: &[&bind_group_layout, &entity_mx_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+            // Create bind group
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: view_proj_globals_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: grass_vbo_storage_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: entity_uniform_buf.as_entire_binding(),
+                }],
+                label: None,
+            });
+
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
+                label: Some("Compute"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+            ComputePass {
+                pipeline,
+                bind_group,
+                storage_vbo_buf: grass_vbo_storage_buf
+            }
+        };
+
         let shadow_pass = {
             let uniform_size = size_of::<GlobalUniforms>() as wgpu::BufferAddress;
             // Create pipeline layout
@@ -508,7 +641,7 @@ impl crate::framework::Example for Example {
                     label: None,
                     entries: &[wgpu::BindGroupLayoutEntry {
                         binding: 0, // global
-                        visibility: wgpu::ShaderStages::VERTEX,
+                        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -519,11 +652,11 @@ impl crate::framework::Example for Example {
                 });
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("shadow"),
-                bind_group_layouts: &[&bind_group_layout, &local_bind_group_layout],
+                bind_group_layouts: &[&bind_group_layout, &entity_mx_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
-            let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            let shadow_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: uniform_size,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -535,7 +668,7 @@ impl crate::framework::Example for Example {
                 layout: &bind_group_layout,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
+                    resource: shadow_uniforms.as_entire_binding(),
                 }],
                 label: None,
             });
@@ -579,7 +712,7 @@ impl crate::framework::Example for Example {
             Pass {
                 pipeline,
                 bind_group,
-                uniform_buf,
+                uniform_buf: shadow_uniforms,
             }
         };
 
@@ -635,20 +768,10 @@ impl crate::framework::Example for Example {
                 });
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("main"),
-                bind_group_layouts: &[&bind_group_layout, &local_bind_group_layout],
+                bind_group_layouts: &[&bind_group_layout, &entity_mx_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
-            let mx_total = Self::generate_matrix(config.width as f32 / config.height as f32);
-            let forward_uniforms = GlobalUniforms {
-                proj: mx_total.to_cols_array_2d(),
-                num_lights: [lights.len() as u32, 0, 0, 0],
-            };
-            let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Uniform Buffer"),
-                contents: bytemuck::bytes_of(&forward_uniforms),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
 
             // Create bind group
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -656,7 +779,7 @@ impl crate::framework::Example for Example {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: uniform_buf.as_entire_binding(),
+                        resource: view_proj_globals_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -696,7 +819,7 @@ impl crate::framework::Example for Example {
                 }),
                 primitive: wgpu::PrimitiveState {
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
+                    cull_mode: None,
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -714,7 +837,7 @@ impl crate::framework::Example for Example {
             Pass {
                 pipeline,
                 bind_group,
-                uniform_buf,
+                uniform_buf: view_proj_globals_buf,
             }
         };
 
