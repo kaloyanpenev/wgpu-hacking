@@ -155,7 +155,7 @@ fn main(@builtin(local_invocation_id) local_id: vec3<u32>,
     // bezier x is towards normal (along z)
     // bezier y is up, along y
     var thid : u32 = global_id.x * 2;
-    var vertex_offset : vec4<f32> = bezier_x * -vec4(1.0, 0.0, 1.0, 0.0);
+    var vertex_offset : vec4<f32> = vec4(0.0, bezier_y, -bezier_x, 0.0); // assumes normal is Z but fix this
     vbos[thid].pos = vbos[thid].pos + vertex_offset;
     vbos[thid + 1].pos = vbos[thid + 1].pos + vertex_offset;
 }

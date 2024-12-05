@@ -299,7 +299,7 @@ impl crate::framework::Example for Example {
         let vbo_size =
             vertex_size * Self::VERTS_PER_GRASSBLADE as wgpu::BufferAddress;
         // NOTE KP: JANK HARDCODE, FIX STEP CALCULATION WRT VERTS PER GRASSBLADE LATER
-        let (vbo_vertex_data, cube_index_data) = create_grass_blade(0.5, 2.0, (Self::VERTS_PER_GRASSBLADE as u16 / 2) - 1);
+        let (vbo_vertex_data, cube_index_data) = create_grass_blade(1.0, 2.0, (Self::VERTS_PER_GRASSBLADE as u16 / 2) - 1);
 
 
         let cube_index_buf = Arc::new(device.create_buffer_init(
@@ -335,25 +335,25 @@ impl crate::framework::Example for Example {
         }
         let cube_descs = [
             CubeDesc {
-                offset: glam::Vec3::new(-2.0, -2.0, 2.0),
+                offset: glam::Vec3::new(-2.0, -2.0, 0.0),
                 angle: 10.0,
                 scale: 0.7,
                 rotation: 0.0,
             },
             CubeDesc {
-                offset: glam::Vec3::new(2.0, -2.0, 2.0),
+                offset: glam::Vec3::new(2.0, -2.0, 0.0),
                 angle: 50.0,
                 scale: 1.3,
                 rotation: 0.0,
             },
             CubeDesc {
-                offset: glam::Vec3::new(-2.0, 2.0, 2.0),
+                offset: glam::Vec3::new(-2.0, 2.0, 0.0),
                 angle: 140.0,
                 scale: 1.1,
                 rotation: 0.0,
             },
             CubeDesc {
-                offset: glam::Vec3::new(2.0, 2.0, 2.0),
+                offset: glam::Vec3::new(2.0, 2.0, 0.0),
                 angle: 210.0,
                 scale: 0.9,
                 rotation: 0.0,
