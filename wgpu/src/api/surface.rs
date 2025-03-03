@@ -1,9 +1,9 @@
-use std::{error, fmt, sync::Arc, thread};
+use alloc::{boxed::Box, string::String, vec, vec::Vec};
+use core::{error, fmt};
 
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-use crate::context::DynContext;
 use crate::*;
 
 /// Describes a [`Surface`].
@@ -24,16 +24,8 @@ static_assertions::assert_impl_all!(SurfaceConfiguration: Send, Sync);
 /// [`GPUCanvasContext`](https://gpuweb.github.io/gpuweb/#canvas-context)
 /// serves a similar role.
 pub struct Surface<'window> {
-    pub(crate) context: Arc<C>,
-
-    /// Optionally, keep the source of the handle used for the surface alive.
-    ///
-    /// This is useful for platforms where the surface is created from a window and the surface
-    /// would become invalid when the window is dropped.
-    pub(crate) _handle_source: Option<Box<dyn WindowHandle + 'window>>,
-
     /// Additional surface data returned by [`DynContext::instance_create_surface`].
-    pub(crate) surface_data: Box<Data>,
+    pub(crate) inner: dispatch::DispatchSurface,
 
     // Stores the latest `SurfaceConfiguration` that was set using `Surface::configure`.
     // It is required to set the attributes of the `SurfaceTexture` in the
@@ -42,6 +34,14 @@ pub struct Surface<'window> {
     // be wrapped in a mutex and since the configuration is only supplied after the surface has
     // been created is is additionally wrapped in an option.
     pub(crate) config: Mutex<Option<SurfaceConfiguration>>,
+
+    /// Optionally, keep the source of the handle used for the surface alive.
+    ///
+    /// This is useful for platforms where the surface is created from a window and the surface
+    /// would become invalid when the window is dropped.
+    ///
+    /// SAFETY: This field must be dropped *after* all other fields to ensure proper cleanup.
+    pub(crate) _handle_source: Option<Box<dyn WindowHandle + 'window>>,
 }
 
 impl Surface<'_> {
@@ -49,11 +49,7 @@ impl Surface<'_> {
     ///
     /// Returns specified values (see [`SurfaceCapabilities`]) if surface is incompatible with the adapter.
     pub fn get_capabilities(&self, adapter: &Adapter) -> SurfaceCapabilities {
-        DynContext::surface_get_capabilities(
-            &*self.context,
-            self.surface_data.as_ref(),
-            adapter.data.as_ref(),
-        )
+        self.inner.get_capabilities(&adapter.inner)
     }
 
     /// Return a default `SurfaceConfiguration` from width and height to use for the [`Surface`] with this adapter.
@@ -80,18 +76,20 @@ impl Surface<'_> {
 
     /// Initializes [`Surface`] for presentation.
     ///
+    /// If the surface is already configured, this will wait for the GPU to come idle
+    /// before recreating the swapchain to prevent race conditions.
+    ///
+    /// # Validation Errors
+    /// - Submissions that happen _during_ the configure may cause the
+    ///   internal wait-for-idle to fail, raising a validation error.
+    ///
     /// # Panics
     ///
     /// - A old [`SurfaceTexture`] is still alive referencing an old surface.
     /// - Texture format requested is unsupported on the surface.
     /// - `config.width` or `config.height` is zero.
     pub fn configure(&self, device: &Device, config: &SurfaceConfiguration) {
-        DynContext::surface_configure(
-            &*self.context,
-            self.surface_data.as_ref(),
-            device.data.as_ref(),
-            config,
-        );
+        self.inner.configure(&device.inner, config);
 
         let mut conf = self.config.lock();
         *conf = Some(config.clone());
@@ -106,8 +104,7 @@ impl Surface<'_> {
     /// If a SurfaceTexture referencing this surface is alive when the swapchain is recreated,
     /// recreating the swapchain will panic.
     pub fn get_current_texture(&self) -> Result<SurfaceTexture, SurfaceError> {
-        let (texture_data, status, detail) =
-            DynContext::surface_get_current_texture(&*self.context, self.surface_data.as_ref());
+        let (texture, status, detail) = self.inner.get_current_texture();
 
         let suboptimal = match status {
             SurfaceStatus::Good => false,
@@ -115,6 +112,7 @@ impl Surface<'_> {
             SurfaceStatus::Timeout => return Err(SurfaceError::Timeout),
             SurfaceStatus::Outdated => return Err(SurfaceError::Outdated),
             SurfaceStatus::Lost => return Err(SurfaceError::Lost),
+            SurfaceStatus::Unknown => return Err(SurfaceError::Other),
         };
 
         let guard = self.config.lock();
@@ -137,11 +135,10 @@ impl Surface<'_> {
             view_formats: &[],
         };
 
-        texture_data
-            .map(|data| SurfaceTexture {
+        texture
+            .map(|texture| SurfaceTexture {
                 texture: Texture {
-                    context: Arc::clone(&self.context),
-                    data,
+                    inner: texture,
                     descriptor,
                 },
                 suboptimal,
@@ -161,16 +158,18 @@ impl Surface<'_> {
     pub unsafe fn as_hal<A: wgc::hal_api::HalApi, F: FnOnce(Option<&A::Surface>) -> R, R>(
         &self,
         hal_surface_callback: F,
-    ) -> Option<R> {
-        self.context
-            .as_any()
-            .downcast_ref::<crate::backend::ContextWgpuCore>()
-            .map(|ctx| unsafe {
-                ctx.surface_as_hal::<A, F, R>(
-                    crate::context::downcast_ref(self.surface_data.as_ref()),
-                    hal_surface_callback,
-                )
-            })
+    ) -> R {
+        let core_surface = self.inner.as_core_opt();
+
+        if let Some(core_surface) = core_surface {
+            unsafe {
+                core_surface
+                    .context
+                    .surface_as_hal::<A, F, R>(core_surface, hal_surface_callback)
+            }
+        } else {
+            hal_surface_callback(None)
+        }
     }
 }
 
@@ -179,7 +178,6 @@ impl Surface<'_> {
 impl fmt::Debug for Surface<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Surface")
-            .field("context", &self.context)
             .field(
                 "_handle_source",
                 &if self._handle_source.is_some() {
@@ -188,7 +186,7 @@ impl fmt::Debug for Surface<'_> {
                     "None"
                 },
             )
-            .field("data", &self.surface_data)
+            .field("inner", &self.inner)
             .field("config", &self.config)
             .finish()
     }
@@ -197,13 +195,7 @@ impl fmt::Debug for Surface<'_> {
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(Surface<'_>: Send, Sync);
 
-impl Drop for Surface<'_> {
-    fn drop(&mut self) {
-        if !thread::panicking() {
-            self.context.surface_drop(self.surface_data.as_ref())
-        }
-    }
-}
+crate::cmp::impl_eq_ord_hash_proxy!(Surface<'_> => .inner);
 
 /// Super trait for window handles as used in [`SurfaceTarget`].
 pub trait WindowHandle: HasWindowHandle + HasDisplayHandle + WasmNotSendSync {}
@@ -288,7 +280,7 @@ pub enum SurfaceTargetUnsafe {
     ///
     /// - `raw_window_handle` & `raw_display_handle` must be valid objects to create a surface upon.
     /// - `raw_window_handle` & `raw_display_handle` must remain valid until after the returned
-    ///    [`Surface`] is  dropped.
+    ///   [`Surface`] is  dropped.
     RawHandle {
         /// Raw display handle, underlying display must outlive the surface created from this.
         raw_display_handle: raw_window_handle::RawDisplayHandle,
@@ -303,7 +295,7 @@ pub enum SurfaceTargetUnsafe {
     ///
     /// - layer must be a valid object to create a surface upon.
     #[cfg(metal)]
-    CoreAnimationLayer(*mut std::ffi::c_void),
+    CoreAnimationLayer(*mut core::ffi::c_void),
 
     /// Surface from `IDCompositionVisual`.
     ///
@@ -311,7 +303,7 @@ pub enum SurfaceTargetUnsafe {
     ///
     /// - visual must be a valid `IDCompositionVisual` to create a surface upon.  Its refcount will be incremented internally and kept live as long as the resulting [`Surface`] is live.
     #[cfg(dx12)]
-    CompositionVisual(*mut std::ffi::c_void),
+    CompositionVisual(*mut core::ffi::c_void),
 
     /// Surface from DX12 `DirectComposition` handle.
     ///
@@ -322,7 +314,7 @@ pub enum SurfaceTargetUnsafe {
     /// - surface_handle must be a valid `DirectComposition` handle to create a surface upon.   Its lifetime **will not** be internally managed: this handle **should not** be freed before
     ///   the resulting [`Surface`] is destroyed.
     #[cfg(dx12)]
-    SurfaceHandle(*mut std::ffi::c_void),
+    SurfaceHandle(*mut core::ffi::c_void),
 
     /// Surface from DX12 `SwapChainPanel`.
     ///
@@ -330,7 +322,7 @@ pub enum SurfaceTargetUnsafe {
     ///
     /// - visual must be a valid SwapChainPanel to create a surface upon.  Its refcount will be incremented internally and kept live as long as the resulting [`Surface`] is live.
     #[cfg(dx12)]
-    SwapChainPanel(*mut std::ffi::c_void),
+    SwapChainPanel(*mut core::ffi::c_void),
 }
 
 impl SurfaceTargetUnsafe {
@@ -364,7 +356,7 @@ pub(crate) enum CreateSurfaceErrorKind {
     Hal(wgc::instance::CreateSurfaceError),
 
     /// Error from WebGPU surface creation.
-    #[allow(dead_code)] // may be unused depending on target and features
+    #[cfg_attr(not(webgpu), expect(dead_code))]
     Web(String),
 
     /// Error when trying to get a [`DisplayHandle`] or a [`WindowHandle`] from

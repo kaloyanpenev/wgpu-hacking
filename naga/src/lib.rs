@@ -253,6 +253,7 @@ An override expression can be evaluated at pipeline creation time.
 mod arena;
 pub mod back;
 mod block;
+pub mod common;
 #[cfg(feature = "compact")]
 pub mod compact;
 pub mod diagnostic_filter;
@@ -282,9 +283,15 @@ pub const BOOL_WIDTH: Bytes = 1;
 pub const ABSTRACT_WIDTH: Bytes = 8;
 
 /// Hash map that is faster but not resilient to DoS attacks.
-pub type FastHashMap<K, T> = rustc_hash::FxHashMap<K, T>;
+/// (Similar to rustc_hash::FxHashMap but using hashbrown::HashMap instead of std::collections::HashMap.)
+/// To construct a new instance: `FastHashMap::default()`
+pub type FastHashMap<K, T> =
+    hashbrown::HashMap<K, T, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+
 /// Hash set that is faster but not resilient to DoS attacks.
-pub type FastHashSet<K> = rustc_hash::FxHashSet<K>;
+/// (Similar to rustc_hash::FxHashSet but using hashbrown::HashSet instead of std::collections::HashMap.)
+pub type FastHashSet<K> =
+    hashbrown::HashSet<K, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
 /// Insertion-order-preserving hash set (`IndexSet<K>`), but with the same
 /// hasher as `FastHashSet<K>` (faster but not resilient to DoS attacks).
@@ -324,6 +331,7 @@ pub(crate) type NamedExpressions = FastIndexMap<Handle<Expression>, String>;
 pub struct EarlyDepthTest {
     pub conservative: Option<ConservativeDepth>,
 }
+
 /// Enables adjusting depth without disabling early Z.
 ///
 /// To use in a shader:
@@ -486,6 +494,15 @@ pub struct Scalar {
     pub width: Bytes,
 }
 
+#[derive(Clone, Copy, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serialize", derive(Serialize))]
+#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+pub enum PendingArraySize {
+    Expression(Handle<Expression>),
+    Override(Handle<Override>),
+}
+
 /// Size of an array.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
@@ -495,6 +512,8 @@ pub struct Scalar {
 pub enum ArraySize {
     /// The array size is constant.
     Constant(std::num::NonZeroU32),
+    /// The array size is an override-expression.
+    Pending(PendingArraySize),
     /// The array size can change at runtime.
     Dynamic,
 }
@@ -585,6 +604,8 @@ bitflags::bitflags! {
         const LOAD = 0x1;
         /// Storage can be used as a target for store ops.
         const STORE = 0x2;
+        /// Storage can be used as a target for atomic ops.
+        const ATOMIC = 0x4;
     }
 }
 
@@ -628,6 +649,7 @@ pub enum StorageFormat {
     Rg11b10Ufloat,
 
     // 64-bit formats
+    R64Uint,
     Rg32Uint,
     Rg32Sint,
     Rg32Float,
@@ -951,7 +973,7 @@ pub enum Binding {
 }
 
 /// Pipeline binding information for global resources.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serialize", derive(Serialize))]
 #[cfg_attr(feature = "deserialize", derive(Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
@@ -1349,6 +1371,8 @@ bitflags::bitflags! {
         const WORK_GROUP = 1 << 1;
         /// Barrier synchronizes execution across all invocations within a subgroup that execute this instruction.
         const SUB_GROUP = 1 << 2;
+        /// Barrier synchronizes texture memory accesses in a workgroup.
+        const TEXTURE = 1 << 3;
     }
 }
 
@@ -1757,6 +1781,16 @@ pub enum RayQueryFunction {
         result: Handle<Expression>,
     },
 
+    /// Add a candidate generated intersection to be included
+    /// in the determination of the closest hit for a ray query.
+    GenerateIntersection {
+        hit_t: Handle<Expression>,
+    },
+
+    /// Confirm a triangle intersection to be included in the determination of
+    /// the closest hit for a ray query.
+    ConfirmIntersection,
+
     Terminate,
 }
 
@@ -1937,14 +1971,18 @@ pub enum Statement {
         /// If [`SHADER_INT64_ATOMIC_MIN_MAX`] or [`SHADER_INT64_ATOMIC_ALL_OPS`] are
         /// enabled, this may also be [`I64`] or [`U64`].
         ///
+        /// If [`SHADER_FLOAT32_ATOMIC`] is enabled, this may be [`F32`].
+        ///
         /// [`Pointer`]: TypeInner::Pointer
         /// [`Atomic`]: TypeInner::Atomic
         /// [`I32`]: Scalar::I32
         /// [`U32`]: Scalar::U32
         /// [`SHADER_INT64_ATOMIC_MIN_MAX`]: crate::valid::Capabilities::SHADER_INT64_ATOMIC_MIN_MAX
         /// [`SHADER_INT64_ATOMIC_ALL_OPS`]: crate::valid::Capabilities::SHADER_INT64_ATOMIC_ALL_OPS
+        /// [`SHADER_FLOAT32_ATOMIC`]: crate::valid::Capabilities::SHADER_FLOAT32_ATOMIC
         /// [`I64`]: Scalar::I64
         /// [`U64`]: Scalar::U64
+        /// [`F32`]: Scalar::F32
         pointer: Handle<Expression>,
 
         /// Function to run on the atomic value.
@@ -1955,14 +1993,24 @@ pub enum Statement {
         ///   value here.
         ///
         /// - The [`SHADER_INT64_ATOMIC_MIN_MAX`] capability allows
-        ///   [`AtomicFunction::Min`] and [`AtomicFunction::Max`] here.
+        ///   [`AtomicFunction::Min`] and [`AtomicFunction::Max`]
+        ///   in the [`Storage`] address space here.
         ///
         /// - If neither of those capabilities are present, then 64-bit scalar
         ///   atomics are not allowed.
         ///
+        /// If [`pointer`] refers to a 32-bit floating-point atomic value, then:
+        ///
+        /// - The [`SHADER_FLOAT32_ATOMIC`] capability allows [`AtomicFunction::Add`],
+        ///   [`AtomicFunction::Subtract`], and [`AtomicFunction::Exchange { compare: None }`]
+        ///   in the [`Storage`] address space here.
+        ///
+        /// [`AtomicFunction::Exchange { compare: None }`]: AtomicFunction::Exchange
         /// [`pointer`]: Statement::Atomic::pointer
+        /// [`Storage`]: AddressSpace::Storage
         /// [`SHADER_INT64_ATOMIC_MIN_MAX`]: crate::valid::Capabilities::SHADER_INT64_ATOMIC_MIN_MAX
         /// [`SHADER_INT64_ATOMIC_ALL_OPS`]: crate::valid::Capabilities::SHADER_INT64_ATOMIC_ALL_OPS
+        /// [`SHADER_FLOAT32_ATOMIC`]: crate::valid::Capabilities::SHADER_FLOAT32_ATOMIC
         fun: AtomicFunction,
 
         /// Value to use in the function.
@@ -1990,6 +2038,49 @@ pub enum Statement {
         /// [`SHADER_INT64_ATOMIC_MIN_MAX`]: crate::valid::Capabilities::SHADER_INT64_ATOMIC_MIN_MAX
         /// [`SHADER_INT64_ATOMIC_ALL_OPS`]: crate::valid::Capabilities::SHADER_INT64_ATOMIC_ALL_OPS
         result: Option<Handle<Expression>>,
+    },
+    /// Performs an atomic operation on a texel value of an image.
+    ///
+    /// Doing atomics on images with mipmaps is not supported, so there is no
+    /// `level` operand.
+    ImageAtomic {
+        /// The image to perform an atomic operation on. This must have type
+        /// [`Image`]. (This will necessarily be a [`GlobalVariable`] or
+        /// [`FunctionArgument`] expression, since no other expressions are
+        /// allowed to have that type.)
+        ///
+        /// [`Image`]: TypeInner::Image
+        /// [`GlobalVariable`]: Expression::GlobalVariable
+        /// [`FunctionArgument`]: Expression::FunctionArgument
+        image: Handle<Expression>,
+
+        /// The coordinate of the texel we wish to load. This must be a scalar
+        /// for [`D1`] images, a [`Bi`] vector for [`D2`] images, and a [`Tri`]
+        /// vector for [`D3`] images. (Array indices, sample indices, and
+        /// explicit level-of-detail values are supplied separately.) Its
+        /// component type must be [`Sint`].
+        ///
+        /// [`D1`]: ImageDimension::D1
+        /// [`D2`]: ImageDimension::D2
+        /// [`D3`]: ImageDimension::D3
+        /// [`Bi`]: VectorSize::Bi
+        /// [`Tri`]: VectorSize::Tri
+        /// [`Sint`]: ScalarKind::Sint
+        coordinate: Handle<Expression>,
+
+        /// The index into an arrayed image. If the [`arrayed`] flag in
+        /// `image`'s type is `true`, then this must be `Some(expr)`, where
+        /// `expr` is a [`Sint`] scalar. Otherwise, it must be `None`.
+        ///
+        /// [`arrayed`]: TypeInner::Image::arrayed
+        /// [`Sint`]: ScalarKind::Sint
+        array_index: Option<Handle<Expression>>,
+
+        /// The kind of atomic operation to perform on the texel.
+        fun: AtomicFunction,
+
+        /// The value with which to perform the atomic operation.
+        value: Handle<Expression>,
     },
     /// Load uniformly from a uniform pointer in the workgroup address space.
     ///
@@ -2104,18 +2195,29 @@ pub struct Function {
     pub local_variables: Arena<LocalVariable>,
     /// Expressions used inside this function.
     ///
-    /// If an [`Expression`] is in this arena, then its subexpressions are in this
-    /// arena too. In other words, every `Handle<Expression>` in this arena
-    /// refers to an [`Expression`] in this arena too. The only way this arena
-    /// can refer to [`Module::global_expressions`] is indirectly, via
-    /// [`Constant`] and [`Override`] expressions, which hold handles for their
-    /// respective types.
+    /// Unless explicitly stated otherwise, if an [`Expression`] is in this
+    /// arena, then its subexpressions are in this arena too. In other words,
+    /// every `Handle<Expression>` in this arena refers to an [`Expression`] in
+    /// this arena too.
+    ///
+    /// The main ways this arena refers to [`Module::global_expressions`] are:
+    ///
+    /// - [`Constant`], [`Override`], and [`GlobalVariable`] expressions hold
+    ///   handles for their respective types, whose initializer expressions are
+    ///   in [`Module::global_expressions`].
+    ///
+    /// - Various expressions hold [`Type`] handles, and [`Type`]s may refer to
+    ///   global expressions, for things like array lengths.
+    ///
+    /// - [`Expression::ImageSample::offset`] refers to an expression in
+    ///   [`Module::global_expressions`].
     ///
     /// An [`Expression`] must occur before all other [`Expression`]s that use
     /// its value.
     ///
     /// [`Constant`]: Expression::Constant
     /// [`Override`]: Expression::Override
+    /// [`GlobalVariable`]: Expression::GlobalVariable
     pub expressions: Arena<Expression>,
     /// Map of expressions that have associated variable names
     pub named_expressions: NamedExpressions,
@@ -2186,6 +2288,8 @@ pub struct EntryPoint {
     pub early_depth_test: Option<EarlyDepthTest>,
     /// Workgroup size for compute stages
     pub workgroup_size: [u32; 3],
+    /// Override expressions for workgroup size in the global_expressions arena
+    pub workgroup_size_overrides: Option<[Option<Handle<Expression>>; 3]>,
     /// The entrance function.
     pub function: Function,
 }
@@ -2203,11 +2307,11 @@ pub enum PredeclaredType {
     AtomicCompareExchangeWeakResult(Scalar),
     ModfResult {
         size: Option<VectorSize>,
-        width: Bytes,
+        scalar: Scalar,
     },
     FrexpResult {
         size: Option<VectorSize>,
-        width: Bytes,
+        scalar: Scalar,
     },
 }
 
@@ -2303,12 +2407,37 @@ pub enum RayQueryIntersection {
 /// Alternatively, you can load an existing shader using one of the [available front ends][front].
 ///
 /// When finished, you can export modules using one of the [available backends][back].
+///
+/// ## Module arenas
+///
+/// Most module contents are stored in [`Arena`]s. In a valid module, arena
+/// elements only refer to prior arena elements. That is, whenever an element in
+/// some `Arena<T>` contains a `Handle<T>` referring to another element the same
+/// arena, the handle's referent always precedes the element containing the
+/// handle.
+///
+/// The elements of [`Module::types`] may refer to [`Expression`]s in
+/// [`Module::global_expressions`], and those expressions may in turn refer back
+/// to [`Type`]s in [`Module::types`]. In a valid module, there exists an order
+/// in which all types and global expressions can be visited such that:
+///
+/// - types and expressions are visited in the order in which they appear in
+///   their arenas, and
+///
+/// - every element refers only to previously visited elements.
+///
+/// This implies that the graph of types and global expressions is acyclic.
+/// (However, it is a stronger condition: there are cycle-free arrangements of
+/// types and expressions for which an order like the one described above does
+/// not exist. Modules arranged in such a way are not valid.)
 #[derive(Debug, Default, Clone)]
 #[cfg_attr(feature = "serialize", derive(Serialize))]
 #[cfg_attr(feature = "deserialize", derive(Deserialize))]
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
 pub struct Module {
     /// Arena for the types defined in this module.
+    ///
+    /// See the [`Module`] docs for more details about this field.
     pub types: UniqueArena<Type>,
     /// Dictionary of special type handles.
     pub special_types: SpecialTypes,
@@ -2324,8 +2453,7 @@ pub struct Module {
     /// arena too. In other words, every `Handle<Expression>` in this arena
     /// refers to an [`Expression`] in this arena too.
     ///
-    /// Each `Expression` must occur in the arena before any
-    /// `Expression` that uses its value.
+    /// See the [`Module`] docs for more details about this field.
     ///
     /// [Constant expressions]: index.html#constant-expressions
     /// [override expressions]: index.html#override-expressions

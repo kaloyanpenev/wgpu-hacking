@@ -1,3 +1,9 @@
+use alloc::{sync::Arc, vec::Vec};
+
+use arrayvec::ArrayVec;
+use thiserror::Error;
+use wgt::{BufferAddress, BufferUsages, Extent3d, TextureSelector, TextureUsages};
+
 #[cfg(feature = "trace")]
 use crate::device::trace::Command as TraceCommand;
 use crate::{
@@ -16,14 +22,7 @@ use crate::{
         MissingTextureUsageError, ParentDevice, Texture, TextureErrorDimension,
     },
     snatch::SnatchGuard,
-    track::TextureSelector,
 };
-
-use arrayvec::ArrayVec;
-use thiserror::Error;
-use wgt::{BufferAddress, BufferUsages, Extent3d, TextureUsages};
-
-use std::sync::Arc;
 
 use super::{ClearError, CommandBufferMutable};
 
@@ -146,6 +145,13 @@ pub enum TransferError {
     MissingDownlevelFlags(#[from] MissingDownlevelFlags),
     #[error("Source texture sample count must be 1, got {sample_count}")]
     InvalidSampleCount { sample_count: u32 },
+    #[error(
+        "Source sample count ({src_sample_count:?}) and destination sample count ({dst_sample_count:?}) are not equal"
+    )]
+    SampleCountNotEqual {
+        src_sample_count: u32,
+        dst_sample_count: u32,
+    },
     #[error("Requested mip level {requested} does no exist (count: {count})")]
     InvalidMipLevel { requested: u32, count: u32 },
 }
@@ -444,7 +450,7 @@ fn handle_texture_init(
 
     // In rare cases we may need to insert an init operation immediately onto the command buffer.
     if !immediate_inits.is_empty() {
-        let cmd_buf_raw = cmd_buf_data.encoder.open(device)?;
+        let cmd_buf_raw = cmd_buf_data.encoder.open()?;
         for init in immediate_inits {
             clear_texture(
                 &init.texture,
@@ -549,8 +555,9 @@ impl Global {
         let cmd_buf = hub
             .command_buffers
             .get(command_encoder_id.into_command_buffer_id());
-        let mut cmd_buf_data = cmd_buf.try_get()?;
-        cmd_buf_data.check_recording()?;
+        let mut cmd_buf_data = cmd_buf.data.lock();
+        let mut cmd_buf_data_guard = cmd_buf_data.record()?;
+        let cmd_buf_data = &mut *cmd_buf_data_guard;
 
         let device = &cmd_buf.device;
         device.check_is_valid()?;
@@ -575,7 +582,7 @@ impl Global {
         let src_pending = cmd_buf_data
             .trackers
             .buffers
-            .set_single(&src_buffer, hal::BufferUses::COPY_SRC);
+            .set_single(&src_buffer, wgt::BufferUses::COPY_SRC);
 
         let src_raw = src_buffer.try_raw(&snatch_guard)?;
         src_buffer
@@ -591,7 +598,7 @@ impl Global {
         let dst_pending = cmd_buf_data
             .trackers
             .buffers
-            .set_single(&dst_buffer, hal::BufferUses::COPY_DST);
+            .set_single(&dst_buffer, wgt::BufferUses::COPY_DST);
 
         let dst_raw = dst_buffer.try_raw(&snatch_guard)?;
         dst_buffer
@@ -652,6 +659,7 @@ impl Global {
 
         if size == 0 {
             log::trace!("Ignoring copy_buffer_to_buffer of size 0");
+            cmd_buf_data_guard.mark_successful();
             return Ok(());
         }
 
@@ -676,7 +684,7 @@ impl Global {
             dst_offset: destination_offset,
             size: wgt::BufferSize::new(size).unwrap(),
         };
-        let cmd_buf_raw = cmd_buf_data.encoder.open(&cmd_buf.device)?;
+        let cmd_buf_raw = cmd_buf_data.encoder.open()?;
         let barriers = src_barrier
             .into_iter()
             .chain(dst_barrier)
@@ -685,6 +693,8 @@ impl Global {
             cmd_buf_raw.transition_buffers(&barriers);
             cmd_buf_raw.copy_buffer_to_buffer(src_raw, dst_raw, &[region]);
         }
+
+        cmd_buf_data_guard.mark_successful();
         Ok(())
     }
 
@@ -707,8 +717,9 @@ impl Global {
         let cmd_buf = hub
             .command_buffers
             .get(command_encoder_id.into_command_buffer_id());
-        let mut cmd_buf_data = cmd_buf.try_get()?;
-        cmd_buf_data.check_recording()?;
+        let mut cmd_buf_data = cmd_buf.data.lock();
+        let mut cmd_buf_data_guard = cmd_buf_data.record()?;
+        let cmd_buf_data = &mut *cmd_buf_data_guard;
 
         let device = &cmd_buf.device;
         device.check_is_valid()?;
@@ -724,6 +735,7 @@ impl Global {
 
         if copy_size.width == 0 || copy_size.height == 0 || copy_size.depth_or_array_layers == 0 {
             log::trace!("Ignoring copy_buffer_to_texture of size 0");
+            cmd_buf_data_guard.mark_successful();
             return Ok(());
         }
 
@@ -746,7 +758,7 @@ impl Global {
         // have an easier time inserting "immediate-inits" that may be required
         // by prior discards in rare cases.
         handle_dst_texture_init(
-            &mut cmd_buf_data,
+            cmd_buf_data,
             device,
             destination,
             copy_size,
@@ -761,7 +773,7 @@ impl Global {
         let src_pending = cmd_buf_data
             .trackers
             .buffers
-            .set_single(&src_buffer, hal::BufferUses::COPY_SRC);
+            .set_single(&src_buffer, wgt::BufferUses::COPY_SRC);
 
         let src_raw = src_buffer.try_raw(&snatch_guard)?;
         src_buffer
@@ -772,7 +784,7 @@ impl Global {
         let dst_pending = cmd_buf_data.trackers.textures.set_single(
             &dst_texture,
             dst_range,
-            hal::TextureUses::COPY_DST,
+            wgt::TextureUses::COPY_DST,
         );
         let dst_raw = dst_texture.try_raw(&snatch_guard)?;
         dst_texture
@@ -832,12 +844,14 @@ impl Global {
             })
             .collect::<Vec<_>>();
 
-        let cmd_buf_raw = cmd_buf_data.encoder.open(&cmd_buf.device)?;
+        let cmd_buf_raw = cmd_buf_data.encoder.open()?;
         unsafe {
             cmd_buf_raw.transition_textures(&dst_barrier);
             cmd_buf_raw.transition_buffers(src_barrier.as_slice());
             cmd_buf_raw.copy_buffer_to_texture(src_raw, dst_raw, &regions);
         }
+
+        cmd_buf_data_guard.mark_successful();
         Ok(())
     }
 
@@ -860,14 +874,15 @@ impl Global {
         let cmd_buf = hub
             .command_buffers
             .get(command_encoder_id.into_command_buffer_id());
-        let mut cmd_buf_data = cmd_buf.try_get()?;
-        cmd_buf_data.check_recording()?;
+        let mut cmd_buf_data = cmd_buf.data.lock();
+        let mut cmd_buf_data_guard = cmd_buf_data.record()?;
+        let cmd_buf_data = &mut *cmd_buf_data_guard;
 
         let device = &cmd_buf.device;
         device.check_is_valid()?;
 
         #[cfg(feature = "trace")]
-        if let Some(ref mut list) = cmd_buf_data.commands {
+        if let Some(list) = cmd_buf_data.commands.as_mut() {
             list.push(TraceCommand::CopyTextureToBuffer {
                 src: *source,
                 dst: *destination,
@@ -877,6 +892,7 @@ impl Global {
 
         if copy_size.width == 0 || copy_size.height == 0 || copy_size.depth_or_array_layers == 0 {
             log::trace!("Ignoring copy_texture_to_buffer of size 0");
+            cmd_buf_data_guard.mark_successful();
             return Ok(());
         }
 
@@ -895,7 +911,7 @@ impl Global {
         // have an easier time inserting "immediate-inits" that may be required
         // by prior discards in rare cases.
         handle_src_texture_init(
-            &mut cmd_buf_data,
+            cmd_buf_data,
             device,
             source,
             copy_size,
@@ -906,7 +922,7 @@ impl Global {
         let src_pending = cmd_buf_data.trackers.textures.set_single(
             &src_texture,
             src_range,
-            hal::TextureUses::COPY_SRC,
+            wgt::TextureUses::COPY_SRC,
         );
         let src_raw = src_texture.try_raw(&snatch_guard)?;
         src_texture
@@ -936,7 +952,7 @@ impl Global {
         let dst_pending = cmd_buf_data
             .trackers
             .buffers
-            .set_single(&dst_buffer, hal::BufferUses::COPY_DST);
+            .set_single(&dst_buffer, wgt::BufferUses::COPY_DST);
 
         let dst_raw = dst_buffer.try_raw(&snatch_guard)?;
         dst_buffer
@@ -994,17 +1010,19 @@ impl Global {
                 }
             })
             .collect::<Vec<_>>();
-        let cmd_buf_raw = cmd_buf_data.encoder.open(&cmd_buf.device)?;
+        let cmd_buf_raw = cmd_buf_data.encoder.open()?;
         unsafe {
             cmd_buf_raw.transition_buffers(dst_barrier.as_slice());
             cmd_buf_raw.transition_textures(&src_barrier);
             cmd_buf_raw.copy_texture_to_buffer(
                 src_raw,
-                hal::TextureUses::COPY_SRC,
+                wgt::TextureUses::COPY_SRC,
                 dst_raw,
                 &regions,
             );
         }
+
+        cmd_buf_data_guard.mark_successful();
         Ok(())
     }
 
@@ -1027,8 +1045,9 @@ impl Global {
         let cmd_buf = hub
             .command_buffers
             .get(command_encoder_id.into_command_buffer_id());
-        let mut cmd_buf_data = cmd_buf.try_get()?;
-        cmd_buf_data.check_recording()?;
+        let mut cmd_buf_data = cmd_buf.data.lock();
+        let mut cmd_buf_data_guard = cmd_buf_data.record()?;
+        let cmd_buf_data = &mut *cmd_buf_data_guard;
 
         let device = &cmd_buf.device;
         device.check_is_valid()?;
@@ -1046,6 +1065,7 @@ impl Global {
 
         if copy_size.width == 0 || copy_size.height == 0 || copy_size.depth_or_array_layers == 0 {
             log::trace!("Ignoring copy_texture_to_texture of size 0");
+            cmd_buf_data_guard.mark_successful();
             return Ok(());
         }
 
@@ -1088,11 +1108,19 @@ impl Global {
             return Err(TransferError::CopyDstMissingAspects.into());
         }
 
+        if src_texture.desc.sample_count != dst_texture.desc.sample_count {
+            return Err(TransferError::SampleCountNotEqual {
+                src_sample_count: src_texture.desc.sample_count,
+                dst_sample_count: dst_texture.desc.sample_count,
+            }
+            .into());
+        }
+
         // Handle texture init *before* dealing with barrier transitions so we
         // have an easier time inserting "immediate-inits" that may be required
         // by prior discards in rare cases.
         handle_src_texture_init(
-            &mut cmd_buf_data,
+            cmd_buf_data,
             device,
             source,
             copy_size,
@@ -1100,7 +1128,7 @@ impl Global {
             &snatch_guard,
         )?;
         handle_dst_texture_init(
-            &mut cmd_buf_data,
+            cmd_buf_data,
             device,
             destination,
             copy_size,
@@ -1111,7 +1139,7 @@ impl Global {
         let src_pending = cmd_buf_data.trackers.textures.set_single(
             &src_texture,
             src_range,
-            hal::TextureUses::COPY_SRC,
+            wgt::TextureUses::COPY_SRC,
         );
         let src_raw = src_texture.try_raw(&snatch_guard)?;
         src_texture
@@ -1127,7 +1155,7 @@ impl Global {
         let dst_pending = cmd_buf_data.trackers.textures.set_single(
             &dst_texture,
             dst_range,
-            hal::TextureUses::COPY_DST,
+            wgt::TextureUses::COPY_DST,
         );
         let dst_raw = dst_texture.try_raw(&snatch_guard)?;
         dst_texture
@@ -1154,17 +1182,18 @@ impl Global {
                 }
             })
             .collect::<Vec<_>>();
-        let cmd_buf_raw = cmd_buf_data.encoder.open(&cmd_buf.device)?;
+        let cmd_buf_raw = cmd_buf_data.encoder.open()?;
         unsafe {
             cmd_buf_raw.transition_textures(&barriers);
             cmd_buf_raw.copy_texture_to_texture(
                 src_raw,
-                hal::TextureUses::COPY_SRC,
+                wgt::TextureUses::COPY_SRC,
                 dst_raw,
                 &regions,
             );
         }
 
+        cmd_buf_data_guard.mark_successful();
         Ok(())
     }
 }

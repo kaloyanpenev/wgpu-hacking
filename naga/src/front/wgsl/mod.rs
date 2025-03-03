@@ -4,7 +4,6 @@ Frontend for [WGSL][wgsl] (WebGPU Shading Language).
 [wgsl]: https://gpuweb.github.io/gpuweb/wgsl.html
 */
 
-mod diagnostic_filter;
 mod error;
 mod index;
 mod lower;
@@ -20,6 +19,10 @@ use thiserror::Error;
 pub use crate::front::wgsl::error::ParseError;
 use crate::front::wgsl::lower::Lowerer;
 use crate::Scalar;
+
+pub use crate::front::wgsl::parse::directive::language_extension::{
+    ImplementedLanguageExtension, LanguageExtension, UnimplementedLanguageExtension,
+};
 
 pub struct Frontend {
     parser: Parser,
@@ -39,7 +42,7 @@ impl Frontend {
     fn inner<'a>(&mut self, source: &'a str) -> Result<crate::Module, Error<'a>> {
         let tu = self.parser.parse(source)?;
         let index = index::Index::generate(&tu)?;
-        let module = Lowerer::new(&index).lower(&tu)?;
+        let module = Lowerer::new(&index).lower(tu)?;
 
         Ok(module)
     }

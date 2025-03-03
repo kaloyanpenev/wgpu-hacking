@@ -1,4 +1,4 @@
-use std::{sync::Arc, thread};
+use alloc::vec::Vec;
 
 use crate::*;
 
@@ -7,7 +7,9 @@ use crate::*;
 /// in subsequent executions
 ///
 /// This reuse is only applicable for the same or similar devices.
-/// See [`util::pipeline_cache_key`] for some details.
+/// See [`util::pipeline_cache_key`] for some details and a suggested workflow.
+///
+/// Created using [`Device::create_pipeline_cache`].
 ///
 /// # Background
 ///
@@ -30,6 +32,7 @@ use crate::*;
 ///
 /// # Usage
 ///
+/// This is used as [`RenderPipelineDescriptor::cache`] or [`ComputePipelineDescriptor::cache`].
 /// It is valid to use this resource when creating multiple pipelines, in
 /// which case it will likely cache each of those pipelines.
 /// It is also valid to create a new cache for each pipeline.
@@ -64,14 +67,15 @@ use crate::*;
 /// This type is unique to the Rust API of `wgpu`.
 ///
 /// [renaming]: std::fs::rename
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PipelineCache {
-    pub(crate) context: Arc<C>,
-    pub(crate) data: Box<Data>,
+    pub(crate) inner: crate::dispatch::DispatchPipelineCache,
 }
 
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(PipelineCache: Send, Sync);
+
+crate::cmp::impl_eq_ord_hash_proxy!(PipelineCache => .inner);
 
 impl PipelineCache {
     /// Get the data associated with this pipeline cache.
@@ -81,14 +85,6 @@ impl PipelineCache {
     ///
     /// This function is unique to the Rust API of `wgpu`.
     pub fn get_data(&self) -> Option<Vec<u8>> {
-        self.context.pipeline_cache_get_data(self.data.as_ref())
-    }
-}
-
-impl Drop for PipelineCache {
-    fn drop(&mut self) {
-        if !thread::panicking() {
-            self.context.pipeline_cache_drop(self.data.as_ref());
-        }
+        self.inner.get_data()
     }
 }

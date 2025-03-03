@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use alloc::{borrow::ToOwned as _, boxed::Box, sync::Arc};
+use core::{fmt, iter};
 
 use crate::{
     hal_api::HalApi,
@@ -31,7 +32,7 @@ pub struct Global {
 }
 
 impl Global {
-    pub fn new(name: &str, instance_desc: wgt::InstanceDescriptor) -> Self {
+    pub fn new(name: &str, instance_desc: &wgt::InstanceDescriptor) -> Self {
         profiling::scope!("Global::new");
         Self {
             instance: Instance::new(name, instance_desc),
@@ -50,7 +51,7 @@ impl Global {
         Self {
             instance: Instance {
                 name: name.to_owned(),
-                instance_per_backend: std::iter::once((A::VARIANT, dyn_instance)).collect(),
+                instance_per_backend: iter::once((A::VARIANT, dyn_instance)).collect(),
                 ..Default::default()
             },
             surfaces: Registry::new(),
@@ -82,6 +83,12 @@ impl Global {
             surfaces: self.surfaces.generate_report(),
             hub: self.hub.generate_report(),
         }
+    }
+}
+
+impl fmt::Debug for Global {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Global").finish()
     }
 }
 

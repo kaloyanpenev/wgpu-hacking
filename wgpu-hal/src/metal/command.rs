@@ -1,6 +1,10 @@
 use super::{conv, AsNative, TimestampQuerySupport};
 use crate::CommandEncoder as _;
-use std::{borrow::Cow, mem::size_of, ops::Range};
+use std::{
+    borrow::{Cow, ToOwned as _},
+    ops::Range,
+    vec::Vec,
+};
 
 // has to match `Temp::binding_sizes`
 const WORD_SIZE: usize = 4;
@@ -279,7 +283,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
     unsafe fn copy_texture_to_texture<T>(
         &mut self,
         src: &super::Texture,
-        _src_usage: crate::TextureUses,
+        _src_usage: wgt::TextureUses,
         dst: &super::Texture,
         regions: T,
     ) where
@@ -358,7 +362,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
     unsafe fn copy_texture_to_buffer<T>(
         &mut self,
         src: &super::Texture,
-        _src_usage: crate::TextureUses,
+        _src_usage: wgt::TextureUses,
         dst: &super::Buffer,
         regions: T,
     ) where
@@ -390,6 +394,15 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 conv::get_blit_option(src.format, copy.texture_base.aspect),
             );
         }
+    }
+
+    unsafe fn copy_acceleration_structure_to_acceleration_structure(
+        &mut self,
+        _src: &super::AccelerationStructure,
+        _dst: &super::AccelerationStructure,
+        _copy: wgt::AccelerationStructureCopy,
+    ) {
+        unimplemented!()
     }
 
     unsafe fn begin_query(&mut self, set: &super::QuerySet, index: u32) {
@@ -750,6 +763,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
                     Some(res.as_native()),
                 );
             }
+
+            // Call useResource on all textures and buffers used indirectly so they are alive
+            for (resource, use_info) in group.resources_to_use.iter() {
+                encoder.use_resource_at(resource.as_native(), use_info.uses, use_info.stages);
+            }
         }
 
         if let Some(ref encoder) = self.state.compute {
@@ -806,6 +824,14 @@ impl crate::CommandEncoder for super::CommandEncoder {
                     (bg_info.base_resource_indices.cs.textures + index) as u64,
                     Some(res.as_native()),
                 );
+            }
+
+            // Call useResource on all textures and buffers used indirectly so they are alive
+            for (resource, use_info) in group.resources_to_use.iter() {
+                if !use_info.visible_in_compute {
+                    continue;
+                }
+                encoder.use_resource(resource.as_native(), use_info.uses);
             }
         }
     }
@@ -1230,8 +1256,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
             .zip(pipeline.work_group_memory_sizes.iter())
             .enumerate()
         {
-            const ALIGN_MASK: u32 = 0xF; // must be a multiple of 16 bytes
-            let size = ((*pipeline_size - 1) | ALIGN_MASK) + 1;
+            let size = pipeline_size.next_multiple_of(16);
             if *cur_size != size {
                 *cur_size = size;
                 encoder.set_threadgroup_memory_length(index as _, size as _);
@@ -1279,6 +1304,14 @@ impl crate::CommandEncoder for super::CommandEncoder {
     ) {
         unimplemented!()
     }
+
+    unsafe fn read_acceleration_structure_compact_size(
+        &mut self,
+        _acceleration_structure: &super::AccelerationStructure,
+        _buf: &super::Buffer,
+    ) {
+        unimplemented!()
+    }
 }
 
 impl Drop for super::CommandEncoder {
@@ -1295,5 +1328,6 @@ impl Drop for super::CommandEncoder {
         unsafe {
             self.discard_encoding();
         }
+        self.counters.command_encoders.sub(1);
     }
 }

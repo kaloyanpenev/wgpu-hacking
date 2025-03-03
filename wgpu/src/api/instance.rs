@@ -1,8 +1,27 @@
+#[cfg(native)]
+use alloc::vec::Vec;
+use core::future::Future;
+
 use parking_lot::Mutex;
 
-use crate::*;
+use crate::{dispatch::InstanceInterface, *};
 
-use std::{future::Future, sync::Arc};
+bitflags::bitflags! {
+    /// WGSL language extensions.
+    ///
+    /// WGSL spec.: <https://www.w3.org/TR/WGSL/#language-extensions-sec>
+    #[derive(Debug, Clone, PartialEq, PartialOrd, Ord, Eq, Hash)]
+    pub struct WgslLanguageFeatures: u32 {
+        /// <https://www.w3.org/TR/WGSL/#language_extension-readonly_and_readwrite_storage_textures>
+        const ReadOnlyAndReadWriteStorageTextures = 1 << 0;
+        /// <https://www.w3.org/TR/WGSL/#language_extension-packed_4x8_integer_dot_product>
+        const Packed4x8IntegerDotProduct = 1 << 1;
+        /// <https://www.w3.org/TR/WGSL/#language_extension-unrestricted_pointer_parameters>
+        const UnrestrictedPointerParameters = 1 << 2;
+        /// <https://www.w3.org/TR/WGSL/#language_extension-pointer_composite_access>
+        const PointerCompositeAccess = 1 << 3;
+    }
+}
 
 /// Context for all other wgpu objects. Instance of wgpu.
 ///
@@ -12,12 +31,14 @@ use std::{future::Future, sync::Arc};
 /// Does not have to be kept alive.
 ///
 /// Corresponds to [WebGPU `GPU`](https://gpuweb.github.io/gpuweb/#gpu-interface).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Instance {
-    context: Arc<C>,
+    inner: dispatch::DispatchInstance,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(Instance: Send, Sync);
+
+crate::cmp::impl_eq_ord_hash_proxy!(Instance => .inner);
 
 impl Default for Instance {
     /// Creates a new instance of wgpu with default options.
@@ -29,7 +50,7 @@ impl Default for Instance {
     /// If no backend feature for the active target platform is enabled,
     /// this method will panic, see [`Instance::enabled_backend_features()`].
     fn default() -> Self {
-        Self::new(InstanceDescriptor::default())
+        Self::new(&InstanceDescriptor::default())
     }
 }
 
@@ -41,47 +62,27 @@ impl Instance {
     ///
     /// `InstanceDescriptor::backends` does not need to be a subset of this,
     /// but any backend that is not in this set, will not be picked.
-    ///
-    /// TODO: Right now it's otherwise not possible yet to opt-out of all features on some platforms.
-    /// See <https://github.com/gfx-rs/wgpu/issues/3514>
-    /// * Windows/Linux/Android: always enables Vulkan and GLES with no way to opt out
     pub const fn enabled_backend_features() -> Backends {
         let mut backends = Backends::empty();
-
-        if cfg!(native) {
-            if cfg!(metal) {
-                backends = backends.union(Backends::METAL);
-            }
-            if cfg!(dx12) {
-                backends = backends.union(Backends::DX12);
-            }
-
-            // Windows, Android, Linux currently always enable Vulkan and OpenGL.
-            // See <https://github.com/gfx-rs/wgpu/issues/3514>
-            if cfg!(target_os = "windows") || cfg!(unix) {
-                backends = backends.union(Backends::VULKAN).union(Backends::GL);
-            }
-
-            // Vulkan on Mac/iOS is only available through vulkan-portability.
-            if (cfg!(target_os = "ios") || cfg!(target_os = "macos"))
-                && cfg!(feature = "vulkan-portability")
-            {
-                backends = backends.union(Backends::VULKAN);
-            }
-
-            // GL on Mac is only available through angle.
-            if cfg!(target_os = "macos") && cfg!(feature = "angle") {
-                backends = backends.union(Backends::GL);
-            }
-        } else {
-            if cfg!(webgpu) {
-                backends = backends.union(Backends::BROWSER_WEBGPU);
-            }
-            if cfg!(webgl) {
-                backends = backends.union(Backends::GL);
-            }
+        // `.set` and `|=` don't work in a `const` context.
+        if cfg!(noop) {
+            backends = backends.union(Backends::NOOP);
         }
-
+        if cfg!(vulkan) {
+            backends = backends.union(Backends::VULKAN);
+        }
+        if cfg!(any(gles, webgl)) {
+            backends = backends.union(Backends::GL);
+        }
+        if cfg!(metal) {
+            backends = backends.union(Backends::METAL);
+        }
+        if cfg!(dx12) {
+            backends = backends.union(Backends::DX12);
+        }
+        if cfg!(webgpu) {
+            backends = backends.union(Backends::BROWSER_WEBGPU);
+        }
         backends
     }
 
@@ -110,8 +111,8 @@ impl Instance {
     ///
     /// If no backend feature for the active target platform is enabled,
     /// this method will panic, see [`Instance::enabled_backend_features()`].
-    #[allow(unreachable_code)]
-    pub fn new(_instance_desc: InstanceDescriptor) -> Self {
+    #[allow(clippy::allow_attributes, unreachable_code)]
+    pub fn new(_instance_desc: &InstanceDescriptor) -> Self {
         if Self::enabled_backend_features().is_empty() {
             panic!(
                 "No wgpu backend feature that is implemented for the target platform was enabled. \
@@ -129,7 +130,7 @@ impl Instance {
 
             if is_only_available_backend || (requested_webgpu && support_webgpu) {
                 return Self {
-                    context: Arc::from(crate::backend::ContextWebGpu::init(_instance_desc)),
+                    inner: crate::backend::ContextWebGpu::new(_instance_desc).into(),
                 };
             }
         }
@@ -137,7 +138,7 @@ impl Instance {
         #[cfg(wgpu_core)]
         {
             return Self {
-                context: Arc::from(crate::backend::ContextWgpuCore::init(_instance_desc)),
+                inner: crate::backend::ContextWgpuCore::new(_instance_desc).into(),
             };
         }
 
@@ -158,9 +159,9 @@ impl Instance {
     #[cfg(wgpu_core)]
     pub unsafe fn from_hal<A: wgc::hal_api::HalApi>(hal_instance: A::Instance) -> Self {
         Self {
-            context: Arc::new(unsafe {
-                crate::backend::ContextWgpuCore::from_hal_instance::<A>(hal_instance)
-            }),
+            inner: unsafe {
+                crate::backend::ContextWgpuCore::from_hal_instance::<A>(hal_instance).into()
+            },
         }
     }
 
@@ -176,10 +177,8 @@ impl Instance {
     /// [`Instance`]: hal::Api::Instance
     #[cfg(wgpu_core)]
     pub unsafe fn as_hal<A: wgc::hal_api::HalApi>(&self) -> Option<&A::Instance> {
-        self.context
-            .as_any()
-            // If we don't have a wgpu-core instance, we don't have a hal instance either.
-            .downcast_ref::<crate::backend::ContextWgpuCore>()
+        self.inner
+            .as_core_opt()
             .and_then(|ctx| unsafe { ctx.instance_as_hal::<A>() })
     }
 
@@ -195,9 +194,9 @@ impl Instance {
     #[cfg(wgpu_core)]
     pub unsafe fn from_core(core_instance: wgc::instance::Instance) -> Self {
         Self {
-            context: Arc::new(unsafe {
-                crate::backend::ContextWgpuCore::from_core_instance(core_instance)
-            }),
+            inner: unsafe {
+                crate::backend::ContextWgpuCore::from_core_instance(core_instance).into()
+            },
         }
     }
 
@@ -208,20 +207,21 @@ impl Instance {
     /// - `backends` - Backends from which to enumerate adapters.
     #[cfg(native)]
     pub fn enumerate_adapters(&self, backends: Backends) -> Vec<Adapter> {
-        let context = Arc::clone(&self.context);
-        self.context
-            .as_any()
-            .downcast_ref::<crate::backend::ContextWgpuCore>()
-            .map(|ctx| {
-                ctx.enumerate_adapters(backends)
-                    .into_iter()
-                    .map(move |adapter| crate::Adapter {
-                        context: Arc::clone(&context),
-                        data: Box::new(adapter),
-                    })
-                    .collect()
+        let Some(core_instance) = self.inner.as_core_opt() else {
+            return Vec::new();
+        };
+
+        core_instance
+            .enumerate_adapters(backends)
+            .into_iter()
+            .map(|adapter| {
+                let core = backend::wgpu_core::CoreAdapter {
+                    context: core_instance.clone(),
+                    id: adapter,
+                };
+                crate::Adapter { inner: core.into() }
             })
-            .unwrap()
+            .collect()
     }
 
     /// Retrieves an [`Adapter`] which matches the given [`RequestAdapterOptions`].
@@ -235,9 +235,8 @@ impl Instance {
         &self,
         options: &RequestAdapterOptions<'_, '_>,
     ) -> impl Future<Output = Option<Adapter>> + WasmNotSend {
-        let context = Arc::clone(&self.context);
-        let adapter = self.context.instance_request_adapter(options);
-        async move { adapter.await.map(|data| Adapter { context, data }) }
+        let future = self.inner.request_adapter(options);
+        async move { future.await.map(|adapter| Adapter { inner: adapter }) }
     }
 
     /// Converts a wgpu-hal `ExposedAdapter` to a wgpu [`Adapter`].
@@ -250,18 +249,14 @@ impl Instance {
         &self,
         hal_adapter: hal::ExposedAdapter<A>,
     ) -> Adapter {
-        let context = Arc::clone(&self.context);
-        let adapter = unsafe {
-            context
-                .as_any()
-                .downcast_ref::<crate::backend::ContextWgpuCore>()
-                .unwrap()
-                .create_adapter_from_hal(hal_adapter)
+        let core_instance = self.inner.as_core();
+        let adapter = unsafe { core_instance.create_adapter_from_hal(hal_adapter) };
+        let core = backend::wgpu_core::CoreAdapter {
+            context: core_instance.clone(),
+            id: adapter,
         };
-        Adapter {
-            context,
-            data: Box::new(adapter),
-        }
+
+        Adapter { inner: core.into() }
     }
 
     /// Creates a new surface targeting a given window/canvas/surface/etc..
@@ -298,7 +293,7 @@ impl Instance {
                 handle_source = None;
 
                 let value: &wasm_bindgen::JsValue = &canvas;
-                let obj = std::ptr::NonNull::from(value).cast();
+                let obj = core::ptr::NonNull::from(value).cast();
                 let raw_window_handle = raw_window_handle::WebCanvasWindowHandle::new(obj).into();
                 let raw_display_handle = raw_window_handle::WebDisplayHandle::new().into();
 
@@ -317,7 +312,7 @@ impl Instance {
                 handle_source = None;
 
                 let value: &wasm_bindgen::JsValue = &canvas;
-                let obj = std::ptr::NonNull::from(value).cast();
+                let obj = core::ptr::NonNull::from(value).cast();
                 let raw_window_handle =
                     raw_window_handle::WebOffscreenCanvasWindowHandle::new(obj).into();
                 let raw_display_handle = raw_window_handle::WebDisplayHandle::new().into();
@@ -352,12 +347,11 @@ impl Instance {
         &self,
         target: SurfaceTargetUnsafe,
     ) -> Result<Surface<'window>, CreateSurfaceError> {
-        let data = unsafe { self.context.instance_create_surface(target) }?;
+        let surface = unsafe { self.inner.create_surface(target)? };
 
         Ok(Surface {
-            context: Arc::clone(&self.context),
             _handle_source: None,
-            surface_data: data,
+            inner: surface,
             config: Mutex::new(None),
         })
     }
@@ -379,7 +373,7 @@ impl Instance {
     ///
     /// [`Queue`s]: Queue
     pub fn poll_all(&self, force_wait: bool) -> bool {
-        self.context.instance_poll_all_devices(force_wait)
+        self.inner.poll_all_devices(force_wait)
     }
 
     /// Generates memory report.
@@ -388,9 +382,14 @@ impl Instance {
     /// which happens only when WebGPU is pre-selected by the instance creation.
     #[cfg(wgpu_core)]
     pub fn generate_report(&self) -> Option<wgc::global::GlobalReport> {
-        self.context
-            .as_any()
-            .downcast_ref::<crate::backend::ContextWgpuCore>()
-            .map(|ctx| ctx.generate_report())
+        self.inner.as_core_opt().map(|ctx| ctx.generate_report())
+    }
+
+    /// Returns set of supported WGSL language extensions supported by this instance.
+    ///
+    /// <https://www.w3.org/TR/webgpu/#gpuwgsllanguagefeatures>
+    #[cfg(feature = "wgsl")]
+    pub fn wgsl_language_features(&self) -> WgslLanguageFeatures {
+        self.inner.wgsl_language_features()
     }
 }

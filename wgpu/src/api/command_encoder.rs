@@ -1,7 +1,12 @@
-use std::{marker::PhantomData, ops::Range, sync::Arc, thread};
+use core::ops::Range;
 
-use crate::context::DynContext;
-use crate::*;
+use crate::{
+    api::{
+        blas::BlasBuildEntry,
+        tlas::{TlasBuildEntry, TlasPackage},
+    },
+    *,
+};
 
 /// Encodes a series of GPU operations.
 ///
@@ -14,19 +19,12 @@ use crate::*;
 /// Corresponds to [WebGPU `GPUCommandEncoder`](https://gpuweb.github.io/gpuweb/#command-encoder).
 #[derive(Debug)]
 pub struct CommandEncoder {
-    pub(crate) context: Arc<C>,
-    pub(crate) data: Box<Data>,
+    pub(crate) inner: dispatch::DispatchCommandEncoder,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(CommandEncoder: Send, Sync);
 
-impl Drop for CommandEncoder {
-    fn drop(&mut self) {
-        if !thread::panicking() {
-            self.context.command_encoder_drop(self.data.as_ref());
-        }
-    }
-}
+crate::cmp::impl_eq_ord_hash_proxy!(CommandEncoder => .inner);
 
 /// Describes a [`CommandEncoder`].
 ///
@@ -55,32 +53,12 @@ pub type TexelCopyTextureInfo<'a> = TexelCopyTextureInfoBase<&'a Texture>;
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(TexelCopyTextureInfo<'_>: Send, Sync);
 
-use crate::api::blas::{
-    BlasBuildEntry, BlasGeometries, BlasTriangleGeometry, DynContextBlasBuildEntry,
-    DynContextBlasGeometries, DynContextBlasTriangleGeometry, DynContextTlasInstance, TlasInstance,
-};
-use crate::api::tlas::{
-    DynContextTlasBuildEntry, DynContextTlasPackage, TlasBuildEntry, TlasPackage,
-};
-pub use wgt::CopyExternalImageDestInfo as CopyExternalImageDestInfoBase;
-
-/// View of a texture which can be used to copy to a texture, including
-/// color space and alpha premultiplication information.
-///
-/// Corresponds to [WebGPU `GPUCopyExternalImageDestInfo`](
-/// https://gpuweb.github.io/gpuweb/#dictdef-gpuimagecopytexturetagged).
-pub type CopyExternalImageDestInfo<'a> = CopyExternalImageDestInfoBase<&'a Texture>;
-#[cfg(send_sync)]
-static_assertions::assert_impl_all!(TexelCopyTextureInfo<'_>: Send, Sync);
-
 impl CommandEncoder {
     /// Finishes recording and returns a [`CommandBuffer`] that can be submitted for execution.
     pub fn finish(mut self) -> CommandBuffer {
-        let data = DynContext::command_encoder_finish(&*self.context, self.data.as_mut());
-        CommandBuffer {
-            context: Arc::clone(&self.context),
-            data: Some(data),
-        }
+        let buffer = self.inner.finish();
+
+        CommandBuffer { buffer }
     }
 
     /// Begins recording of a render pass.
@@ -97,14 +75,10 @@ impl CommandEncoder {
         &'encoder mut self,
         desc: &RenderPassDescriptor<'_>,
     ) -> RenderPass<'encoder> {
-        let data =
-            DynContext::command_encoder_begin_render_pass(&*self.context, self.data.as_ref(), desc);
+        let rpass = self.inner.begin_render_pass(desc);
         RenderPass {
-            inner: RenderPassInner {
-                data,
-                context: self.context.clone(),
-            },
-            encoder_guard: PhantomData,
+            inner: rpass,
+            _encoder_guard: api::PhantomDrop::default(),
         }
     }
 
@@ -122,17 +96,10 @@ impl CommandEncoder {
         &'encoder mut self,
         desc: &ComputePassDescriptor<'_>,
     ) -> ComputePass<'encoder> {
-        let data = DynContext::command_encoder_begin_compute_pass(
-            &*self.context,
-            self.data.as_ref(),
-            desc,
-        );
+        let cpass = self.inner.begin_compute_pass(desc);
         ComputePass {
-            inner: ComputePassInner {
-                data,
-                context: self.context.clone(),
-            },
-            encoder_guard: PhantomData,
+            inner: cpass,
+            _encoder_guard: api::PhantomDrop::default(),
         }
     }
 
@@ -151,12 +118,10 @@ impl CommandEncoder {
         destination_offset: BufferAddress,
         copy_size: BufferAddress,
     ) {
-        DynContext::command_encoder_copy_buffer_to_buffer(
-            &*self.context,
-            self.data.as_ref(),
-            source.data.as_ref(),
+        self.inner.copy_buffer_to_buffer(
+            &source.inner,
             source_offset,
-            destination.data.as_ref(),
+            &destination.inner,
             destination_offset,
             copy_size,
         );
@@ -169,13 +134,8 @@ impl CommandEncoder {
         destination: TexelCopyTextureInfo<'_>,
         copy_size: Extent3d,
     ) {
-        DynContext::command_encoder_copy_buffer_to_texture(
-            &*self.context,
-            self.data.as_ref(),
-            source,
-            destination,
-            copy_size,
-        );
+        self.inner
+            .copy_buffer_to_texture(source, destination, copy_size);
     }
 
     /// Copy data from a texture to a buffer.
@@ -185,13 +145,8 @@ impl CommandEncoder {
         destination: TexelCopyBufferInfo<'_>,
         copy_size: Extent3d,
     ) {
-        DynContext::command_encoder_copy_texture_to_buffer(
-            &*self.context,
-            self.data.as_ref(),
-            source,
-            destination,
-            copy_size,
-        );
+        self.inner
+            .copy_texture_to_buffer(source, destination, copy_size);
     }
 
     /// Copy data from one texture to another.
@@ -207,13 +162,8 @@ impl CommandEncoder {
         destination: TexelCopyTextureInfo<'_>,
         copy_size: Extent3d,
     ) {
-        DynContext::command_encoder_copy_texture_to_texture(
-            &*self.context,
-            self.data.as_ref(),
-            source,
-            destination,
-            copy_size,
-        );
+        self.inner
+            .copy_texture_to_texture(source, destination, copy_size);
     }
 
     /// Clears texture to zero.
@@ -230,12 +180,7 @@ impl CommandEncoder {
     /// - `CLEAR_TEXTURE` extension not enabled
     /// - Range is out of bounds
     pub fn clear_texture(&mut self, texture: &Texture, subresource_range: &ImageSubresourceRange) {
-        DynContext::command_encoder_clear_texture(
-            &*self.context,
-            self.data.as_ref(),
-            texture.data.as_ref(),
-            subresource_range,
-        );
+        self.inner.clear_texture(&texture.inner, subresource_range);
     }
 
     /// Clears buffer to zero.
@@ -250,28 +195,22 @@ impl CommandEncoder {
         offset: BufferAddress,
         size: Option<BufferAddress>,
     ) {
-        DynContext::command_encoder_clear_buffer(
-            &*self.context,
-            self.data.as_ref(),
-            buffer.data.as_ref(),
-            offset,
-            size,
-        );
+        self.inner.clear_buffer(&buffer.inner, offset, size);
     }
 
     /// Inserts debug marker.
     pub fn insert_debug_marker(&mut self, label: &str) {
-        DynContext::command_encoder_insert_debug_marker(&*self.context, self.data.as_ref(), label);
+        self.inner.insert_debug_marker(label);
     }
 
     /// Start record commands and group it into debug marker group.
     pub fn push_debug_group(&mut self, label: &str) {
-        DynContext::command_encoder_push_debug_group(&*self.context, self.data.as_ref(), label);
+        self.inner.push_debug_group(label);
     }
 
     /// Stops command recording and creates debug group.
     pub fn pop_debug_group(&mut self) {
-        DynContext::command_encoder_pop_debug_group(&*self.context, self.data.as_ref());
+        self.inner.pop_debug_group();
     }
 
     /// Resolves a query set, writing the results into the supplied destination buffer.
@@ -285,15 +224,13 @@ impl CommandEncoder {
         destination: &Buffer,
         destination_offset: BufferAddress,
     ) {
-        DynContext::command_encoder_resolve_query_set(
-            &*self.context,
-            self.data.as_ref(),
-            query_set.data.as_ref(),
+        self.inner.resolve_query_set(
+            &query_set.inner,
             query_range.start,
             query_range.end - query_range.start,
-            destination.data.as_ref(),
+            &destination.inner,
             destination_offset,
-        )
+        );
     }
 
     /// Returns the inner hal CommandEncoder using a callback. The hal command encoder will be `None` if the
@@ -312,16 +249,16 @@ impl CommandEncoder {
     >(
         &mut self,
         hal_command_encoder_callback: F,
-    ) -> Option<R> {
-        self.context
-            .as_any()
-            .downcast_ref::<crate::backend::ContextWgpuCore>()
-            .map(|ctx| unsafe {
-                ctx.command_encoder_as_hal_mut::<A, F, R>(
-                    crate::context::downcast_ref(self.data.as_ref()),
-                    hal_command_encoder_callback,
-                )
-            })
+    ) -> R {
+        if let Some(encoder) = self.inner.as_core_mut_opt() {
+            unsafe {
+                encoder
+                    .context
+                    .command_encoder_as_hal_mut::<A, F, R>(encoder, hal_command_encoder_callback)
+            }
+        } else {
+            hal_command_encoder_callback(None)
+        }
     }
 }
 
@@ -340,12 +277,7 @@ impl CommandEncoder {
     /// recorded so far and all before all commands recorded after.
     /// This may depend both on the backend and the driver.
     pub fn write_timestamp(&mut self, query_set: &QuerySet, query_index: u32) {
-        DynContext::command_encoder_write_timestamp(
-            &*self.context,
-            self.data.as_mut(),
-            query_set.data.as_ref(),
-            query_index,
-        )
+        self.inner.write_timestamp(&query_set.inner, query_index);
     }
 }
 
@@ -359,16 +291,16 @@ impl CommandEncoder {
     /// # Validation
     ///
     /// - blas: Iterator of bottom level acceleration structure entries to build.
-    ///     For each entry, the provided size descriptor must be strictly smaller or equal to the descriptor given at BLAS creation, this means:
-    ///     - Less or equal number of geometries
-    ///     - Same kind of geometry (with index buffer or without) (same vertex/index format)
-    ///     - Same flags
-    ///     - Less or equal number of vertices
-    ///     - Less or equal number of indices (if applicable)
+    ///   For each entry, the provided size descriptor must be strictly smaller or equal to the descriptor given at BLAS creation, this means:
+    ///   - Less or equal number of geometries
+    ///   - Same kind of geometry (with index buffer or without) (same vertex/index format)
+    ///   - Same flags
+    ///   - Less or equal number of vertices
+    ///   - Less or equal number of indices (if applicable)
     /// - tlas: iterator of top level acceleration structure packages to build
-    ///     For each entry:
-    ///     - Each BLAS in each TLAS instance must have been being built in the current call or in a previous call to `build_acceleration_structures` or `build_acceleration_structures_unsafe_tlas`
-    ///     - The number of TLAS instances must be less than or equal to the max number of tlas instances when creating (if creating a package with `TlasPackage::new()` this is already satisfied)
+    ///   For each entry:
+    ///   - Each BLAS in each TLAS instance must have been being built in the current call or in a previous call to `build_acceleration_structures` or `build_acceleration_structures_unsafe_tlas`
+    ///   - The number of TLAS instances must be less than or equal to the max number of tlas instances when creating (if creating a package with `TlasPackage::new()` this is already satisfied)
     ///
     /// If the device the command encoder is created from does not have [Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE] enabled then a validation error is generated
     ///
@@ -387,61 +319,8 @@ impl CommandEncoder {
         blas: impl IntoIterator<Item = &'a BlasBuildEntry<'a>>,
         tlas: impl IntoIterator<Item = &'a TlasPackage>,
     ) {
-        let mut blas = blas.into_iter().map(|e: &BlasBuildEntry<'_>| {
-            let geometries = match &e.geometry {
-                BlasGeometries::TriangleGeometries(triangle_geometries) => {
-                    let iter = triangle_geometries
-                        .iter()
-                        .map(
-                            |tg: &BlasTriangleGeometry<'_>| DynContextBlasTriangleGeometry {
-                                size: tg.size,
-                                vertex_buffer: tg.vertex_buffer.data.as_ref(),
-
-                                index_buffer: tg
-                                    .index_buffer
-                                    .map(|index_buffer| index_buffer.data.as_ref()),
-
-                                transform_buffer: tg
-                                    .transform_buffer
-                                    .map(|transform_buffer| transform_buffer.data.as_ref()),
-
-                                first_vertex: tg.first_vertex,
-                                vertex_stride: tg.vertex_stride,
-                                index_buffer_offset: tg.index_buffer_offset,
-                                transform_buffer_offset: tg.transform_buffer_offset,
-                            },
-                        );
-                    DynContextBlasGeometries::TriangleGeometries(Box::new(iter))
-                }
-            };
-            DynContextBlasBuildEntry {
-                blas_data: e.blas.shared.data.as_ref(),
-                geometries,
-            }
-        });
-
-        let mut tlas = tlas.into_iter().map(|e: &TlasPackage| {
-            let instances = e.instances.iter().map(|instance: &Option<TlasInstance>| {
-                instance.as_ref().map(|instance| DynContextTlasInstance {
-                    blas: instance.blas.data.as_ref(),
-                    transform: &instance.transform,
-                    custom_index: instance.custom_index,
-                    mask: instance.mask,
-                })
-            });
-            DynContextTlasPackage {
-                tlas_data: e.tlas.data.as_ref(),
-                instances: Box::new(instances),
-                lowest_unmodified: e.lowest_unmodified,
-            }
-        });
-
-        DynContext::command_encoder_build_acceleration_structures(
-            &*self.context,
-            self.data.as_ref(),
-            &mut blas,
-            &mut tlas,
-        );
+        self.inner
+            .build_acceleration_structures(&mut blas.into_iter(), &mut tlas.into_iter());
     }
 
     /// Build bottom and top level acceleration structures.
@@ -452,7 +331,7 @@ impl CommandEncoder {
     ///
     ///    - The contents of the raw instance buffer must be valid for the underling api.
     ///    - All bottom level acceleration structures, referenced in the raw instance buffer must be valid and built,
-    ///       when the corresponding top level acceleration structure is built. (builds may happen in the same invocation of this function).
+    ///      when the corresponding top level acceleration structure is built. (builds may happen in the same invocation of this function).
     ///    - At the time when the top level acceleration structure is used in a bind group, all associated bottom level acceleration structures must be valid,
     ///      and built (no later than the time when the top level acceleration structure was built).
     pub unsafe fn build_acceleration_structures_unsafe_tlas<'a>(
@@ -460,52 +339,74 @@ impl CommandEncoder {
         blas: impl IntoIterator<Item = &'a BlasBuildEntry<'a>>,
         tlas: impl IntoIterator<Item = &'a TlasBuildEntry<'a>>,
     ) {
-        let mut blas = blas.into_iter().map(|e: &BlasBuildEntry<'_>| {
-            let geometries = match &e.geometry {
-                BlasGeometries::TriangleGeometries(triangle_geometries) => {
-                    let iter = triangle_geometries
-                        .iter()
-                        .map(
-                            |tg: &BlasTriangleGeometry<'_>| DynContextBlasTriangleGeometry {
-                                size: tg.size,
-                                vertex_buffer: tg.vertex_buffer.data.as_ref(),
+        self.inner.build_acceleration_structures_unsafe_tlas(
+            &mut blas.into_iter(),
+            &mut tlas.into_iter(),
+        );
+    }
 
-                                index_buffer: tg
-                                    .index_buffer
-                                    .map(|index_buffer| index_buffer.data.as_ref()),
-
-                                transform_buffer: tg
-                                    .transform_buffer
-                                    .map(|transform_buffer| transform_buffer.data.as_ref()),
-
-                                first_vertex: tg.first_vertex,
-                                vertex_stride: tg.vertex_stride,
-                                index_buffer_offset: tg.index_buffer_offset,
-                                transform_buffer_offset: tg.transform_buffer_offset,
-                            },
-                        );
-                    DynContextBlasGeometries::TriangleGeometries(Box::new(iter))
-                }
-            };
-            DynContextBlasBuildEntry {
-                blas_data: e.blas.shared.data.as_ref(),
-                geometries,
-            }
-        });
-
-        let mut tlas = tlas
-            .into_iter()
-            .map(|e: &TlasBuildEntry<'_>| DynContextTlasBuildEntry {
-                tlas_data: e.tlas.data.as_ref(),
-                instance_buffer_data: e.instance_buffer.data.as_ref(),
-                instance_count: e.instance_count,
-            });
-
-        DynContext::command_encoder_build_acceleration_structures_unsafe_tlas(
-            &*self.context,
-            self.data.as_ref(),
-            &mut blas,
-            &mut tlas,
+    /// Transition resources to an underlying hal resource state.
+    ///
+    /// This is an advanced, native-only API (no-op on web) that has two main use cases:
+    ///
+    /// # Batching Barriers
+    ///
+    /// Wgpu does not have a global view of the frame when recording command buffers. When you submit multiple command buffers in a single queue submission, wgpu may need to record and
+    /// insert new command buffers (holding 1 or more barrier commands) in between the user-supplied command buffers in order to ensure that resources are transitioned to the correct state
+    /// for the start of the next user-supplied command buffer.
+    ///
+    /// Wgpu does not currently attempt to batch multiple of these generated command buffers/barriers together, which may lead to suboptimal barrier placement.
+    ///
+    /// Consider the following scenario, where the user does `queue.submit(&[a, b, c])`:
+    /// * CommandBuffer A: Use resource X as a render pass attachment
+    /// * CommandBuffer B: Use resource Y as a render pass attachment
+    /// * CommandBuffer C: Use resources X and Y in a bind group
+    ///
+    /// At submission time, wgpu will record and insert some new command buffers, resulting in a submission that looks like `queue.submit(&[0, a, 1, b, 2, c])`:
+    /// * CommandBuffer 0: Barrier to transition resource X from TextureUses::RESOURCE (from last frame) to TextureUses::COLOR_TARGET
+    /// * CommandBuffer A: Use resource X as a render pass attachment
+    /// * CommandBuffer 1: Barrier to transition resource Y from TextureUses::RESOURCE (from last frame) to TextureUses::COLOR_TARGET
+    /// * CommandBuffer B: Use resource Y as a render pass attachment
+    /// * CommandBuffer 2: Barrier to transition resources X and Y from TextureUses::COLOR_TARGET to TextureUses::RESOURCE
+    /// * CommandBuffer C: Use resources X and Y in a bind group
+    ///
+    /// To prevent this, after profiling their app, an advanced user might choose to instead do `queue.submit(&[a, b, c])`:
+    /// * CommandBuffer A:
+    ///     * Use [`CommandEncoder::transition_resources`] to transition resources X and Y from TextureUses::RESOURCE (from last frame) to TextureUses::COLOR_TARGET
+    ///     * Use resource X as a render pass attachment
+    /// * CommandBuffer B: Use resource Y as a render pass attachment
+    /// * CommandBuffer C:
+    ///     * Use [`CommandEncoder::transition_resources`] to transition resources X and Y from TextureUses::COLOR_TARGET to TextureUses::RESOURCE
+    ///     * Use resources X and Y in a bind group
+    ///
+    /// At submission time, wgpu will record and insert some new command buffers, resulting in a submission that looks like `queue.submit(&[0, a, b, 1, c])`:
+    /// * CommandBuffer 0: Barrier to transition resources X and Y from TextureUses::RESOURCE (from last frame) to TextureUses::COLOR_TARGET
+    /// * CommandBuffer A: Use resource X as a render pass attachment
+    /// * CommandBuffer B: Use resource Y as a render pass attachment
+    /// * CommandBuffer 1: Barrier to transition resources X and Y from TextureUses::COLOR_TARGET to TextureUses::RESOURCE
+    /// * CommandBuffer C: Use resources X and Y in a bind group
+    ///
+    /// Which eliminates the extra command buffer and barrier between command buffers A and B.
+    ///
+    /// # Native Interoperability
+    ///
+    /// A user wanting to interoperate with the underlying native graphics APIs (Vulkan, DirectX12, Metal, etc) can use this API to generate barriers between wgpu commands and
+    /// the native API commands, for synchronization and resource state transition purposes.
+    pub fn transition_resources<'a>(
+        &mut self,
+        buffer_transitions: impl Iterator<Item = wgt::BufferTransition<&'a Buffer>>,
+        texture_transitions: impl Iterator<Item = wgt::TextureTransition<&'a Texture>>,
+    ) {
+        self.inner.transition_resources(
+            &mut buffer_transitions.map(|t| wgt::BufferTransition {
+                buffer: &t.buffer.inner,
+                state: t.state,
+            }),
+            &mut texture_transitions.map(|t| wgt::TextureTransition {
+                texture: &t.texture.inner,
+                selector: t.selector,
+                state: t.state,
+            }),
         );
     }
 }

@@ -1,6 +1,7 @@
+use std::{ffi::CStr, path::PathBuf, string::String, vec::Vec};
+
 use crate::auxil::dxgi::result::HResult;
-use std::path::PathBuf;
-use std::{error::Error, ffi::CStr};
+use thiserror::Error;
 use windows::{
     core::{Interface, PCSTR, PCWSTR},
     Win32::Graphics::Direct3D::{Dxc, Fxc},
@@ -97,19 +98,7 @@ struct DxcLib {
 }
 
 impl DxcLib {
-    fn new_dynamic(
-        lib_path: Option<PathBuf>,
-        lib_name: &'static str,
-    ) -> Result<Self, libloading::Error> {
-        let lib_path = if let Some(lib_path) = lib_path {
-            if lib_path.is_file() {
-                lib_path
-            } else {
-                lib_path.join(lib_name)
-            }
-        } else {
-            PathBuf::from(lib_name)
-        };
+    fn new_dynamic(lib_path: PathBuf) -> Result<Self, libloading::Error> {
         unsafe { crate::dx12::DynLib::new(lib_path).map(|lib| Self { lib }) }
     }
 
@@ -123,7 +112,7 @@ impl DxcLib {
                 -> windows_core::HRESULT;
 
             let func: libloading::Symbol<DxcCreateInstanceFn> =
-                self.lib.get(b"DxcCreateInstance\0")?;
+                self.lib.get(c"DxcCreateInstance".to_bytes())?;
             dxc_create_instance::<T>(|clsid, iid, ppv| func(clsid, iid, ppv))
         }
     }
@@ -146,6 +135,7 @@ unsafe fn dxc_create_instance<T: DxcObj>(
 
 // Destructor order should be fine since _dxil and _dxc don't rely on each other.
 pub(super) struct DxcContainer {
+    pub(super) max_shader_model: wgt::DxcShaderModel,
     compiler: Dxc::IDxcCompiler3,
     utils: Dxc::IDxcUtils,
     validator: Option<Dxc::IDxcValidator>,
@@ -157,50 +147,42 @@ pub(super) struct DxcContainer {
     _dxil: Option<DxcLib>,
 }
 
-pub(super) fn get_dynamic_dxc_container(
-    dxc_path: Option<PathBuf>,
-    dxil_path: Option<PathBuf>,
-) -> Result<Option<DxcContainer>, crate::DeviceError> {
-    let dxc = match DxcLib::new_dynamic(dxc_path, "dxcompiler.dll") {
-        Ok(dxc) => dxc,
-        Err(e) => {
-            log::warn!(
-                "Failed to load dxcompiler.dll. Defaulting to FXC instead: {}: {:?}",
-                e,
-                e.source()
-            );
-            return Ok(None);
-        }
-    };
+#[derive(Debug, Error)]
+pub(super) enum GetDynamicDXCContainerError {
+    #[error(transparent)]
+    Device(#[from] crate::DeviceError),
+    #[error("Failed to load {0}: {1}")]
+    FailedToLoad(&'static str, libloading::Error),
+}
 
-    let dxil = match DxcLib::new_dynamic(dxil_path, "dxil.dll") {
-        Ok(dxil) => dxil,
-        Err(e) => {
-            log::warn!(
-                "Failed to load dxil.dll. Defaulting to FXC instead: {}: {:?}",
-                e,
-                e.source()
-            );
-            return Ok(None);
-        }
-    };
+pub(super) fn get_dynamic_dxc_container(
+    dxc_path: PathBuf,
+    dxil_path: PathBuf,
+    max_shader_model: wgt::DxcShaderModel,
+) -> Result<DxcContainer, GetDynamicDXCContainerError> {
+    let dxc = DxcLib::new_dynamic(dxc_path)
+        .map_err(|e| GetDynamicDXCContainerError::FailedToLoad("dxcompiler.dll", e))?;
+
+    let dxil = DxcLib::new_dynamic(dxil_path)
+        .map_err(|e| GetDynamicDXCContainerError::FailedToLoad("dxil.dll", e))?;
 
     let compiler = dxc.create_instance::<Dxc::IDxcCompiler3>()?;
     let utils = dxc.create_instance::<Dxc::IDxcUtils>()?;
     let validator = dxil.create_instance::<Dxc::IDxcValidator>()?;
 
-    Ok(Some(DxcContainer {
+    Ok(DxcContainer {
+        max_shader_model,
         compiler,
         utils,
         validator: Some(validator),
         _dxc: Some(dxc),
         _dxil: Some(dxil),
-    }))
+    })
 }
 
 /// Creates a [`DxcContainer`] that delegates to the statically-linked version of DXC.
-pub(super) fn get_static_dxc_container() -> Result<Option<DxcContainer>, crate::DeviceError> {
-    #[cfg(feature = "static-dxc")]
+pub(super) fn get_static_dxc_container() -> Result<DxcContainer, crate::DeviceError> {
+    #[cfg(static_dxc)]
     {
         unsafe {
             let compiler = dxc_create_instance::<Dxc::IDxcCompiler3>(|clsid, iid, ppv| {
@@ -218,16 +200,17 @@ pub(super) fn get_static_dxc_container() -> Result<Option<DxcContainer>, crate::
                 ))
             })?;
 
-            Ok(Some(DxcContainer {
+            Ok(DxcContainer {
+                max_shader_model: wgt::DxcShaderModel::V6_7,
                 compiler,
                 utils,
                 validator: None,
                 _dxc: None,
                 _dxil: None,
-            }))
+            })
         }
     }
-    #[cfg(not(feature = "static-dxc"))]
+    #[cfg(not(static_dxc))]
     {
         panic!("Attempted to create a static DXC shader compiler, but the static-dxc feature was not enabled")
     }

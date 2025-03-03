@@ -1,9 +1,9 @@
-use std::ops::{Deref, DerefMut};
+use core::ops::{Deref, DerefMut};
 
 use wasm_bindgen::JsValue;
 
 /// Derefs to a [`JsValue`] that's known not to be `undefined` or `null`.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DefinedNonNullJsValue<T>(T);
 
 impl<T> DefinedNonNullJsValue<T>

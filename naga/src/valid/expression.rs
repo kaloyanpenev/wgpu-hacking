@@ -54,8 +54,13 @@ pub enum ExpressionError {
         rhs_expr: Handle<crate::Expression>,
         rhs_type: crate::TypeInner,
     },
-    #[error("Selecting is not possible")]
-    InvalidSelectTypes,
+    #[error("Expected selection argument types to match, but reject value of type {reject:?} does not match accept value of value {accept:?}")]
+    SelectValuesTypeMismatch {
+        accept: crate::TypeInner,
+        reject: crate::TypeInner,
+    },
+    #[error("Expected selection condition to be a boolean value, got {actual:?}")]
+    SelectConditionNotABool { actual: crate::TypeInner },
     #[error("Relational argument {0:?} is not a boolean vector")]
     InvalidBooleanVector(Handle<crate::Expression>),
     #[error("Relational argument {0:?} is not a float")]
@@ -74,6 +79,10 @@ pub enum ExpressionError {
     ExpectedSamplerType(Handle<crate::Type>),
     #[error("Unable to operate on image class {0:?}")]
     InvalidImageClass(crate::ImageClass),
+    #[error("Image atomics are not supported for storage format {0:?}")]
+    InvalidImageFormat(crate::StorageFormat),
+    #[error("Image atomics require atomic storage access, {0:?} is insufficient")]
+    InvalidImageStorageAccess(crate::StorageAccess),
     #[error("Derivatives can only be taken from scalar and vector floats")]
     InvalidDerivative,
     #[error("Image array index parameter is misplaced")]
@@ -253,7 +262,7 @@ impl super::Validator {
                     | Ti::Array { .. }
                     | Ti::Pointer { .. }
                     | Ti::ValuePointer { size: Some(_), .. }
-                    | Ti::BindingArray { .. } => false,
+                    | Ti::BindingArray { .. } => {}
                     ref other => {
                         log::error!("Indexing of {:?}", other);
                         return Err(ExpressionError::InvalidBaseType(base));
@@ -271,25 +280,26 @@ impl super::Validator {
                     }
                 }
 
-                // If we know both the length and the index, we can do the
-                // bounds check now.
-                if let crate::proc::IndexableLength::Known(known_length) =
-                    base_type.indexable_length(module)?
+                // If index is const we can do check for non-negative index
+                match module
+                    .to_ctx()
+                    .eval_expr_to_u32_from(index, &function.expressions)
                 {
-                    match module
-                        .to_ctx()
-                        .eval_expr_to_u32_from(index, &function.expressions)
-                    {
-                        Ok(value) => {
+                    Ok(value) => {
+                        // If we know both the length and the index, we can do the
+                        // bounds check now.
+                        if let crate::proc::IndexableLength::Known(known_length) =
+                            base_type.indexable_length(module)?
+                        {
                             if value >= known_length {
                                 return Err(ExpressionError::IndexOutOfBounds(base, value));
                             }
                         }
-                        Err(crate::proc::U32EvalError::Negative) => {
-                            return Err(ExpressionError::NegativeIndex(base))
-                        }
-                        Err(crate::proc::U32EvalError::NonConst) => {}
                     }
+                    Err(crate::proc::U32EvalError::Negative) => {
+                        return Err(ExpressionError::NegativeIndex(base))
+                    }
+                    Err(crate::proc::U32EvalError::NonConst) => {}
                 }
 
                 ShaderStages::all()
@@ -661,11 +671,15 @@ impl super::Validator {
 
                         match (level, class.is_mipmapped()) {
                             (None, false) => {}
-                            (Some(level), true) => {
-                                if resolver[level].scalar_kind() != Some(Sk::Sint) {
-                                    return Err(ExpressionError::InvalidImageOtherIndexType(level));
+                            (Some(level), true) => match resolver[level] {
+                                Ti::Scalar(Sc {
+                                    kind: Sk::Sint | Sk::Uint,
+                                    width: _,
+                                }) => {}
+                                _ => {
+                                    return Err(ExpressionError::InvalidImageArrayIndexType(level))
                                 }
-                            }
+                            },
                             _ => {
                                 return Err(ExpressionError::InvalidImageOtherIndex);
                             }
@@ -901,7 +915,8 @@ impl super::Validator {
             } => {
                 let accept_inner = &resolver[accept];
                 let reject_inner = &resolver[reject];
-                let condition_good = match resolver[condition] {
+                let condition_ty = &resolver[condition];
+                let condition_good = match *condition_ty {
                     Ti::Scalar(Sc {
                         kind: Sk::Bool,
                         width: _,
@@ -928,8 +943,16 @@ impl super::Validator {
                     },
                     _ => false,
                 };
-                if !condition_good || accept_inner != reject_inner {
-                    return Err(ExpressionError::InvalidSelectTypes);
+                if accept_inner != reject_inner {
+                    return Err(ExpressionError::SelectValuesTypeMismatch {
+                        accept: accept_inner.clone(),
+                        reject: reject_inner.clone(),
+                    });
+                }
+                if !condition_good {
+                    return Err(ExpressionError::SelectConditionNotABool {
+                        actual: condition_ty.clone(),
+                    });
                 }
                 ShaderStages::all()
             }
