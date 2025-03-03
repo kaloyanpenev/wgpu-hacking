@@ -437,22 +437,22 @@ impl crate::framework::Example for Example {
         // currently only grass in the indirect buffer
         let indirect_args = wgpu::util::DrawIndexedIndirectArgs{
             index_count: cube_index_data.len() as u32,
-            instance_count: 4,
+            instance_count: 1,
             first_index: 0,
             base_vertex: 0,
             first_instance: 0,
         };
 
-        // let mut indirect_bytes = Vec::new();
+        let mut indirect_bytes = Vec::new();
 
-        // for i in 0..(entities.len() - 1) {
-        //     indirect_bytes.extend_from_slice(indirect_args.as_bytes());
-        // }
+        for i in 0..(entities.len() - 1) {
+            indirect_bytes.extend_from_slice(indirect_args.as_bytes());
+        }
 
         let indirect_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Indirect Buffer"),
-                contents: indirect_args.as_bytes(),
+                contents: &indirect_bytes,
                 usage: wgpu::BufferUsages::INDIRECT,
             },
         );
@@ -1113,7 +1113,7 @@ impl crate::framework::Example for Example {
             pass.set_index_buffer(entity.index_buf.slice(..), entity.index_format);
             pass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
             //pass.draw_indexed(0..entity.index_count as u32, 0, 0..1);
-            pass.multi_draw_indexed_indirect(&self.indirect_buffer, 0 as BufferAddress, 1 as u32);
+            pass.multi_draw_indexed_indirect(&self.indirect_buffer, 0 as BufferAddress, (self.entities.len() - 1) as u32);
         }
         encoder.pop_debug_group();
 
