@@ -5,6 +5,8 @@ use glam::EulerRot;
 use wgpu::{Features, PolygonMode};
 use wgpu::util::{align_to, DeviceExt};
 
+const WIREFRAME : bool = false;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
@@ -275,11 +277,12 @@ impl crate::framework::Example for Example {
         wgpu::Limits::downlevel_defaults() // These downlevel limits will allow the code to run on all possible hardware
     }
 
-    fn required_features() -> Features {
-        wgpu::Features::POLYGON_MODE_LINE
+    fn required_features() -> wgpu::Features {
+        Features::MULTI_DRAW_INDIRECT
     }
+
     fn optional_features() -> wgpu::Features {
-        wgpu::Features::DEPTH_CLIP_CONTROL
+        wgpu::Features::DEPTH_CLIP_CONTROL | wgpu::Features::POLYGON_MODE_LINE
     }
 
     fn init(
@@ -834,7 +837,12 @@ impl crate::framework::Example for Example {
                 primitive: wgpu::PrimitiveState {
                     front_face: wgpu::FrontFace::Ccw,
                     cull_mode: None,
-                    //polygon_mode: PolygonMode::Line,
+                    polygon_mode: 
+                        if WIREFRAME && device.features().contains(wgpu::Features::POLYGON_MODE_LINE) { 
+                            PolygonMode::Line 
+                        } else { 
+                            PolygonMode::Fill 
+                        },
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
