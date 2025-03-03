@@ -2,8 +2,8 @@ use std::{f32::consts, iter, mem::size_of, ops::Range, sync::Arc};
 use std::ops::Deref;
 use bytemuck::{Pod, Zeroable};
 use glam::EulerRot;
-use wgpu::{Features, PolygonMode};
-use wgpu::util::{align_to, DeviceExt};
+use wgpu::{BufferAddress, Features, PolygonMode};
+use wgpu::util::{align_to, DeviceExt, DrawIndexedIndirectArgs, DrawIndirectArgs};
 
 const WIREFRAME : bool = false;
 
@@ -226,6 +226,7 @@ struct Example {
     entity_bind_group: wgpu::BindGroup,
     light_storage_buf: wgpu::Buffer,
     entity_uniform_buf: wgpu::Buffer,
+    indirect_buffer: wgpu::Buffer,
 }
 
 impl Example {
@@ -432,6 +433,29 @@ impl crate::framework::Example for Example {
                 uniform_offset: ((i + 1) * uniform_alignment as usize) as _,
             });
         }
+
+        // currently only grass in the indirect buffer
+        let indirect_args = wgpu::util::DrawIndexedIndirectArgs{
+            index_count: cube_index_data.len() as u32,
+            instance_count: 4,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        };
+
+        // let mut indirect_bytes = Vec::new();
+
+        // for i in 0..(entities.len() - 1) {
+        //     indirect_bytes.extend_from_slice(indirect_args.as_bytes());
+        // }
+
+        let indirect_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Indirect Buffer"),
+                contents: indirect_args.as_bytes(),
+                usage: wgpu::BufferUsages::INDIRECT,
+            },
+        );
 
         let entity_mx_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -878,6 +902,7 @@ impl crate::framework::Example for Example {
             light_storage_buf,
             entity_uniform_buf,
             entity_bind_group,
+            indirect_buffer
         }
     }
 
@@ -1077,12 +1102,18 @@ impl crate::framework::Example for Example {
             pass.set_pipeline(&self.forward_pass.pipeline);
             pass.set_bind_group(0, &self.forward_pass.bind_group, &[]);
 
-            for entity in &self.entities {
-                pass.set_bind_group(1, &self.entity_bind_group, &[entity.uniform_offset]);
-                pass.set_index_buffer(entity.index_buf.slice(..), entity.index_format);
-                pass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
-                pass.draw_indexed(0..entity.index_count as u32, 0, 0..1);
-            }
+            let entity = &self.entities[0];
+            pass.set_bind_group(1, &self.entity_bind_group, &[entity.uniform_offset]);
+            pass.set_index_buffer(entity.index_buf.slice(..), entity.index_format);
+            pass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
+            pass.draw_indexed(0..entity.index_count as u32, 0, 0..1);
+
+            let entity = &self.entities[2];
+            pass.set_bind_group(1, &self.entity_bind_group, &[entity.uniform_offset]);
+            pass.set_index_buffer(entity.index_buf.slice(..), entity.index_format);
+            pass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
+            //pass.draw_indexed(0..entity.index_count as u32, 0, 0..1);
+            pass.multi_draw_indexed_indirect(&self.indirect_buffer, 0 as BufferAddress, 1 as u32);
         }
         encoder.pop_debug_group();
 

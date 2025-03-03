@@ -91,7 +91,7 @@ fn fs_main(vertex: VertexOutput) -> @location(0) vec4<f32> {
         let light_dir = normalize(light.pos.xyz - vertex.world_position.xyz);
         let diffuse = max(0.0, dot(normal, light_dir));
         // add light contribution
-        color += shadow * diffuse * light.color.xyz;
+        color += diffuse * light.color.xyz; // * shadow;
     }
     // multiply the light by material color
     return vec4<f32>(color, 1.0) * u_entity.color;
