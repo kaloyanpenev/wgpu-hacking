@@ -490,6 +490,7 @@ impl crate::framework::Example for Example {
                 Some(shadow_texture.create_view(&wgpu::TextureViewDescriptor {
                     label: Some("shadow"),
                     format: None,
+                    usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
                     dimension: Some(wgpu::TextureViewDimension::D2),
                     aspect: wgpu::TextureAspect::All,
                     base_mip_level: 0,
