@@ -1,7 +1,8 @@
 use std::{f32::consts, iter, mem::size_of, ops::Range, sync::Arc};
 use std::ops::Deref;
 use bytemuck::{Pod, Zeroable};
-use glam::EulerRot;
+use glam::{EulerRot, Quat, Vec3};
+use nanorand::Rng;
 use wgpu::{BufferAddress, Features, PolygonMode};
 use wgpu::util::{align_to, DeviceExt, DrawIndexedIndirectArgs, DrawIndirectArgs};
 
@@ -227,6 +228,8 @@ struct Example {
     light_storage_buf: wgpu::Buffer,
     entity_uniform_buf: wgpu::Buffer,
     indirect_buffer: wgpu::Buffer,
+    now: web_time::Instant,
+    config: wgpu::SurfaceConfiguration
 }
 
 impl Example {
@@ -240,10 +243,11 @@ impl Example {
     };
     const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-    fn generate_matrix(aspect_ratio: f32) -> glam::Mat4 {
-        let projection = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect_ratio, 1.0, 20.0);
+    fn generate_matrix(aspect_ratio: f32, elapsed_secs: f64) -> glam::Mat4 {
+        let projection = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect_ratio, 1.0, 200.0);
+        let spin_radius = 10.0;
         let view = glam::Mat4::look_at_rh(
-            glam::Vec3::new(3.0f32, -10.0, 6.0),
+            glam::Vec3::new(spin_radius * elapsed_secs.cos() as f32, spin_radius * elapsed_secs.sin() as f32, 10.0),
             glam::Vec3::new(0f32, 0.0, 0.0),
             glam::Vec3::Z,
         );
@@ -314,7 +318,7 @@ impl crate::framework::Example for Example {
             },
         ));
 
-        let (plane_vertex_data, plane_index_data) = create_plane(7);
+        let (plane_vertex_data, plane_index_data) = create_plane(100);
 
         let plane_vertex_desc = wgpu::util::BufferInitDescriptor {
             label: Some("Plane Vertex Buffer"),
@@ -337,35 +341,15 @@ impl crate::framework::Example for Example {
             scale: f32,
             rotation: f32,
         }
-        let cube_descs = [
-            CubeDesc {
-                offset: glam::Vec3::new(-2.0, -2.0, 0.0),
+        let cube_desc = CubeDesc {
+                offset: glam::Vec3::new(0.0, 0.0, 0.0),
                 angle: 10.0,
                 scale: 0.7,
                 rotation: 0.0,
-            },
-            CubeDesc {
-                offset: glam::Vec3::new(2.0, -2.0, 0.0),
-                angle: 50.0,
-                scale: 1.3,
-                rotation: 0.0,
-            },
-            CubeDesc {
-                offset: glam::Vec3::new(-2.0, 2.0, 0.0),
-                angle: 140.0,
-                scale: 1.1,
-                rotation: 0.0,
-            },
-            CubeDesc {
-                offset: glam::Vec3::new(2.0, 2.0, 0.0),
-                angle: 210.0,
-                scale: 0.9,
-                rotation: 0.0,
-            },
-        ];
+            };
 
         let entity_uniform_size = size_of::<EntityUniforms>() as wgpu::BufferAddress;
-        let num_entities = 1 + cube_descs.len() as wgpu::BufferAddress;
+        let num_entities = 2u64; // plane + grass
         // Make the `uniform_alignment` >= `entity_uniform_size` and aligned to `min_uniform_buffer_offset_alignment`.
         let uniform_alignment = {
             let alignment =
@@ -384,8 +368,12 @@ impl crate::framework::Example for Example {
         let index_format = wgpu::IndexFormat::Uint16;
 
         let mut entities = vec![{
+            // plane
             Entity {
-                mx_world: glam::Mat4::IDENTITY,
+                mx_world: glam::Mat4::from_scale_rotation_translation(
+                    Vec3::ONE,
+                    Quat::IDENTITY,
+                    Vec3::new(0.0, 0.0, 0.0)),
                 rotation_speed: 0.0,
                 color: wgpu::Color::WHITE,
                 const_vertex_buf: const_plane_vertex_buf,
@@ -397,62 +385,70 @@ impl crate::framework::Example for Example {
             }
         }];
 
-        for (i, cube) in cube_descs.iter().enumerate() {
-            let mx_world = glam::Mat4::from_scale_rotation_translation(
-                glam::Vec3::splat(cube.scale),
-                glam::Quat::from_euler(EulerRot::XYZ, consts::PI / 2.0, consts::PI / 4.0, 0.0),
-                cube.offset,
-            );
+        let mut rng = nanorand::WyRand::new();
+        let mut spread_offsets : Vec<[f32; 2]> = Vec::new();
+        let grass_count = 1000u32;
 
-            let cube_vertex_buf = device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: Some(format!("Cubes Vertex Buffer {i}").as_str()),
-                    contents: bytemuck::cast_slice(&vbo_vertex_data),
-                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                },
-            );
+        let mx_world = glam::Mat4::from_scale_rotation_translation(
+            glam::Vec3::splat(cube_desc.scale),
+            glam::Quat::from_euler(EulerRot::XYZ, consts::PI / 2.0, consts::PI / 4.0, 0.0),
+            cube_desc.offset,
+        );
 
-            let runtime_vertex_buf = device.create_buffer(
-                &wgpu::BufferDescriptor {
-                    label: Some(format!("Runtime Vertex Buffer {i}").as_str()),
-                    size: vbo_size,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                },
-            );
+        let cube_vertex_buf = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some(format!("Grass Vertex Buffer").as_str()),
+                contents: bytemuck::cast_slice(&vbo_vertex_data),
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            },
+        );
 
-            entities.push(Entity {
-                mx_world,
-                rotation_speed: cube.rotation,
-                color: wgpu::Color::GREEN,
-                const_vertex_buf: cube_vertex_buf,
-                vertex_buf: runtime_vertex_buf,
-                index_buf: Arc::clone(&cube_index_buf),
-                index_format,
-                index_count: cube_index_data.len(),
-                uniform_offset: ((i + 1) * uniform_alignment as usize) as _,
-            });
+        let runtime_vertex_buf = device.create_buffer(
+            &wgpu::BufferDescriptor {
+                label: Some(format!("Grass Runtime Vertex Buffer").as_str()),
+                size: vbo_size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        );
+
+        entities.push(Entity {
+            mx_world,
+            rotation_speed: cube_desc.rotation,
+            color: wgpu::Color::GREEN,
+            const_vertex_buf: cube_vertex_buf,
+            vertex_buf: runtime_vertex_buf,
+            index_buf: Arc::clone(&cube_index_buf),
+            index_format,
+            index_count: cube_index_data.len(),
+            uniform_offset: (1 * uniform_alignment as u32) as _,
+        });
+
+        let offset_magnitude = 20.0;
+        for i in 0..grass_count {
+
+            spread_offsets.push([(rng.generate::<f32>() * 2.0 - 1.0) * offset_magnitude, (rng.generate::<f32>() * 2.0 - 1.0) * offset_magnitude]);
         }
 
         // currently only grass in the indirect buffer
         let indirect_args = wgpu::util::DrawIndexedIndirectArgs{
             index_count: cube_index_data.len() as u32,
-            instance_count: 1,
+            instance_count: grass_count as u32,
             first_index: 0,
             base_vertex: 0,
             first_instance: 0,
         };
 
-        let mut indirect_bytes = Vec::new();
+        // let mut indirect_bytes = Vec::new();
 
-        for i in 0..(entities.len() - 1) {
-            indirect_bytes.extend_from_slice(indirect_args.as_bytes());
-        }
+        // for i in 0..(entities.len() - 1) {
+        //     indirect_bytes.extend_from_slice(indirect_args.as_bytes());
+        // }
 
         let indirect_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Indirect Buffer"),
-                contents: &indirect_bytes,
+                contents: indirect_args.as_bytes(),
                 usage: wgpu::BufferUsages::INDIRECT,
             },
         );
@@ -526,7 +522,7 @@ impl crate::framework::Example for Example {
             .collect::<Vec<_>>();
         let lights = vec![
             Light {
-                pos: glam::Vec3::new(7.0, -5.0, 10.0),
+                pos: glam::Vec3::new(15.0, -5.0, 20.0),
                 color: wgpu::Color {
                     r: 0.5,
                     g: 1.0,
@@ -534,21 +530,21 @@ impl crate::framework::Example for Example {
                     a: 1.0,
                 },
                 fov: 60.0,
-                depth: 1.0..20.0,
+                depth: 0.001..10000.0,
                 target_view: shadow_target_views[0].take().unwrap(),
-            },
-            Light {
-                pos: glam::Vec3::new(-5.0, 7.0, 10.0),
-                color: wgpu::Color {
-                    r: 1.0,
-                    g: 0.5,
-                    b: 0.5,
-                    a: 1.0,
-                },
-                fov: 45.0,
-                depth: 1.0..20.0,
-                target_view: shadow_target_views[1].take().unwrap(),
-            },
+            }
+            // Light {
+            //     pos: glam::Vec3::new(-5.0, 7.0, 10.0),
+            //     color: wgpu::Color {
+            //         r: 1.0,
+            //         g: 0.5,
+            //         b: 0.5,
+            //         a: 1.0,
+            //     },
+            //     fov: 45.0,
+            //     depth: 1.0..20.0,
+            //     target_view: shadow_target_views[1].take().unwrap(),
+            // },
         ];
         let light_uniform_size = (Self::MAX_LIGHTS * size_of::<LightRaw>()) as wgpu::BufferAddress;
         let light_storage_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -572,8 +568,10 @@ impl crate::framework::Example for Example {
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
+        let now = web_time::Instant::now();
 
-        let mx_total = Self::generate_matrix(config.width as f32 / config.height as f32);
+        let mx_total = Self::generate_matrix(config.width as f32 / config.height as f32, now.elapsed().as_secs_f64());
+
         let forward_uniforms = GlobalUniforms {
             proj: mx_total.to_cols_array_2d(),
             num_lights: [lights.len() as u32, 0, 0, 0],
@@ -593,17 +591,7 @@ impl crate::framework::Example for Example {
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: None,
                     entries: &[wgpu::BindGroupLayoutEntry {
-                        binding: 0, // global
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(uniform_size),
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1, // vbo storage
+                        binding: 0, // vbo storage
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -613,7 +601,7 @@ impl crate::framework::Example for Example {
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding: 2, // uniforms storage
+                        binding: 1, // uniforms storage
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -632,7 +620,7 @@ impl crate::framework::Example for Example {
             // we need to allocate: model + color + vertex buffer (calculated as vertex * vert per grassblade) for each grass blade
 
             let grass_vbo_buffer_size =
-                vbo_size * cube_descs.len() as wgpu::BufferAddress;
+                vbo_size as wgpu::BufferAddress;
             let grass_vbo_storage_buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Grass VBO"),
                 size: grass_vbo_buffer_size,
@@ -645,14 +633,10 @@ impl crate::framework::Example for Example {
                 layout: &bind_group_layout,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: view_proj_globals_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
                     resource: grass_vbo_storage_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 2,
+                    binding: 1,
                     resource: entity_uniform_buf.as_entire_binding(),
                 }],
                 label: None,
@@ -662,7 +646,7 @@ impl crate::framework::Example for Example {
                 label: Some("Compute"),
                 layout: Some(&pipeline_layout),
                 module: &shader,
-                entry_point: Some("main"),
+                entry_point: Some("bezier_offset"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -674,6 +658,13 @@ impl crate::framework::Example for Example {
                 vertex_size: vertex_size,
             }
         };
+
+        let grass_spread_uniform_buf_desc = wgpu::util::BufferInitDescriptor {
+            label: Some("Spread Offset Buffer"),
+            contents: bytemuck::cast_slice(&spread_offsets),
+            usage: wgpu::BufferUsages::STORAGE,
+        };
+        let grass_spread_uniform_buf = device.create_buffer_init(&grass_spread_uniform_buf_desc);
 
         let shadow_pass = {
             let uniform_size = size_of::<GlobalUniforms>() as wgpu::BufferAddress;
@@ -688,6 +679,16 @@ impl crate::framework::Example for Example {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
                             min_binding_size: wgpu::BufferSize::new(uniform_size),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4, // spread offsets
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(size_of::<[f32; 2]>() as wgpu::BufferAddress),
                         },
                         count: None,
                     }],
@@ -711,6 +712,10 @@ impl crate::framework::Example for Example {
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
                     resource: shadow_uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: grass_spread_uniform_buf.as_entire_binding(),
                 }],
                 label: None,
             });
@@ -805,6 +810,16 @@ impl crate::framework::Example for Example {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                             count: None,
                         },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4, // spread offsets
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: wgpu::BufferSize::new(size_of::<[f32; 2]>() as wgpu::BufferAddress),
+                            },
+                            count: None,
+                        },
                     ],
                     label: None,
                 });
@@ -834,6 +849,10 @@ impl crate::framework::Example for Example {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: grass_spread_uniform_buf.as_entire_binding(),
                     },
                 ],
                 label: None,
@@ -902,7 +921,9 @@ impl crate::framework::Example for Example {
             light_storage_buf,
             entity_uniform_buf,
             entity_bind_group,
-            indirect_buffer
+            indirect_buffer,
+            now,
+            config: config.clone()
         }
     }
 
@@ -917,7 +938,7 @@ impl crate::framework::Example for Example {
         queue: &wgpu::Queue,
     ) {
         // update view-projection matrix
-        let mx_total = Self::generate_matrix(config.width as f32 / config.height as f32);
+        let mx_total = Self::generate_matrix(config.width as f32 / config.height as f32, self.now.elapsed().as_secs_f64());
         let mx_ref: &[f32; 16] = mx_total.as_ref();
         queue.write_buffer(
             &self.forward_pass.uniform_buf,
@@ -926,10 +947,20 @@ impl crate::framework::Example for Example {
         );
 
         self.forward_depth = Self::create_depth_texture(config, device);
+        self.config = config.clone();
     }
 
     fn render(&mut self, view: &wgpu::TextureView, device: &wgpu::Device, queue: &wgpu::Queue) {
-        // update uniforms
+        // update view-projection matrix
+        let mx_total = Self::generate_matrix(self.config.width as f32 / self.config.height as f32, self.now.elapsed().as_secs_f64());
+        let mx_ref: &[f32; 16] = mx_total.as_ref();
+        queue.write_buffer(
+            &self.forward_pass.uniform_buf,
+            0,
+            bytemuck::cast_slice(mx_ref),
+        );
+
+        //update uniforms
         for entity in self.entities.iter_mut() {
             if entity.rotation_speed != 0.0 {
                 let rotation =
@@ -1058,12 +1089,15 @@ impl crate::framework::Example for Example {
                 pass.set_pipeline(&self.shadow_pass.pipeline);
                 pass.set_bind_group(0, &self.shadow_pass.bind_group, &[]);
 
-                for entity in &self.entities {
+                let entity = &self.entities[1];
+                //for entity in &self.entities {
                     pass.set_bind_group(1, &self.entity_bind_group, &[entity.uniform_offset]);
                     pass.set_index_buffer(entity.index_buf.slice(..), entity.index_format);
                     pass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
-                    pass.draw_indexed(0..entity.index_count as u32, 0, 0..1);
-                }
+                    //pass.draw_indexed(0..entity.index_count as u32, 0, 0..1);
+                //}
+                pass.multi_draw_indexed_indirect(&self.indirect_buffer, 0 as BufferAddress, 1u32);
+
             }
 
             encoder.pop_debug_group();
@@ -1102,18 +1136,22 @@ impl crate::framework::Example for Example {
             pass.set_pipeline(&self.forward_pass.pipeline);
             pass.set_bind_group(0, &self.forward_pass.bind_group, &[]);
 
-            let entity = &self.entities[0];
-            pass.set_bind_group(1, &self.entity_bind_group, &[entity.uniform_offset]);
-            pass.set_index_buffer(entity.index_buf.slice(..), entity.index_format);
-            pass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
-            pass.draw_indexed(0..entity.index_count as u32, 0, 0..1);
+            // plane
+            {
+                let entity = &self.entities[0];
+                pass.set_bind_group(1, &self.entity_bind_group, &[entity.uniform_offset]);
+                pass.set_index_buffer(entity.index_buf.slice(..), entity.index_format);
+                pass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
+                pass.draw_indexed(0..entity.index_count as u32, 0, 0..1);
+            }
 
-            let entity = &self.entities[2];
+            // grass blades
+            let entity = &self.entities[1];
             pass.set_bind_group(1, &self.entity_bind_group, &[entity.uniform_offset]);
             pass.set_index_buffer(entity.index_buf.slice(..), entity.index_format);
             pass.set_vertex_buffer(0, entity.vertex_buf.slice(..));
             //pass.draw_indexed(0..entity.index_count as u32, 0, 0..1);
-            pass.multi_draw_indexed_indirect(&self.indirect_buffer, 0 as BufferAddress, (self.entities.len() - 1) as u32);
+            pass.multi_draw_indexed_indirect(&self.indirect_buffer, 0 as BufferAddress, 1u32);
         }
         encoder.pop_debug_group();
 

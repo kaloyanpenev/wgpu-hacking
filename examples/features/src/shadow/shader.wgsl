@@ -7,6 +7,10 @@ struct Globals {
 @binding(0)
 var<uniform> u_globals: Globals;
 
+@group(0)
+@binding(4)
+var<storage, read> u_spread_offsets: array<vec2<f32>>; 
+
 struct Entity {
     world: mat4x4<f32>,
     color: vec4<f32>,
@@ -17,8 +21,17 @@ struct Entity {
 var<uniform> u_entity: Entity;
 
 @vertex
-fn vs_bake(@location(0) position: vec4<f32>) -> @builtin(position) vec4<f32> {
-    return u_globals.view_proj * u_entity.world * vec4<f32>(position);
+fn vs_bake(@location(0) position: vec4<f32>,
+    @builtin(instance_index) instance_idx: u32
+) -> @builtin(position) vec4<f32> {
+    let spread_offset_mat = transpose(mat4x4f(
+    // in x    y    z   1.0
+        1.0,  0.0, 0.0, u_spread_offsets[instance_idx].x * saturate(f32(instance_idx)),
+        0.0,  1.0, 0.0, 0.0,
+        0.0,  0.0, 1.0, u_spread_offsets[instance_idx].y * saturate(f32(instance_idx)), 
+        0.0,  0.0, 0.0, 1.0,
+    ));
+    return u_globals.view_proj * u_entity.world * spread_offset_mat * vec4<f32>(position);
 }
 
 struct VertexOutput {
@@ -31,9 +44,17 @@ struct VertexOutput {
 fn vs_main(
     @location(0) position: vec4<f32>,
     @location(1) normal: vec4<f32>,
+    @builtin(instance_index) instance_idx: u32,
 ) -> VertexOutput {
     let w = u_entity.world;
-    let world_pos = u_entity.world * vec4<f32>(position);
+    let spread_offset_mat = transpose(mat4x4f(
+        // in x    y    z   1.0
+            1.0,  0.0, 0.0, u_spread_offsets[instance_idx].x * saturate(f32(instance_idx)),
+            0.0,  1.0, 0.0, 0.0,
+            0.0,  0.0, 1.0, u_spread_offsets[instance_idx].y * saturate(f32(instance_idx)), 
+            0.0,  0.0, 0.0, 1.0,
+        ));
+    let world_pos = u_entity.world * spread_offset_mat * vec4<f32>(position);
     var result: VertexOutput;
     result.world_normal = mat3x3<f32>(w[0].xyz, w[1].xyz, w[2].xyz) * vec3<f32>(normal.xyz);
     result.world_position = world_pos;
@@ -61,6 +82,7 @@ var t_shadow: texture_depth_2d_array;
 @group(0)
 @binding(3)
 var sampler_shadow: sampler_comparison;
+
 
 fn fetch_shadow(light_id: u32, homogeneous_coords: vec4<f32>) -> f32 {
     if (homogeneous_coords.w <= 0.0) {
@@ -91,7 +113,7 @@ fn fs_main(vertex: VertexOutput) -> @location(0) vec4<f32> {
         let light_dir = normalize(light.pos.xyz - vertex.world_position.xyz);
         let diffuse = max(0.0, dot(normal, light_dir));
         // add light contribution
-        color += diffuse * light.color.xyz; // * shadow;
+        color += diffuse * light.color.xyz * shadow * 2.0;
     }
     // multiply the light by material color
     return vec4<f32>(color, 1.0) * u_entity.color;
@@ -122,15 +144,15 @@ struct Vertex
 
 
 @group(0)
-@binding(1)
-var<storage, read_write> vbos: array<Vertex>; // write the verts
+@binding(0)
+var<storage, read_write> verts: array<Vertex>; // write the verts
 @group(0)
-@binding(2)
+@binding(1)
 var<storage, read> v_entities: array<Entity>; // read the model so we can take into account where it is in the future - would need to compare pos to wind texture
 
 @compute
 @workgroup_size(64, 1, 1)
-fn main(@builtin(local_invocation_id) local_id: vec3<u32>,
+fn bezier_offset(@builtin(local_invocation_id) local_id: vec3<u32>,
         @builtin(global_invocation_id) global_id: vec3<u32>) {
     // based on https://www.desmos.com/calculator/d1ofwre0fr
     var p0 = vec2(0.0, 0.0);
@@ -154,8 +176,8 @@ fn main(@builtin(local_invocation_id) local_id: vec3<u32>,
 
     // bezier x is towards normal (along z)
     // bezier y is up, along y
-    var thid : u32 = global_id.x * 2;
+    var thid : u32 = global_id.x * 2; // stride is 2
     var vertex_offset : vec4<f32> = vec4(0.0, bezier_y, -bezier_x, 0.0); // assumes normal is Z but fix this
-    vbos[thid].pos = vbos[thid].pos + vertex_offset;
-    vbos[thid + 1].pos = vbos[thid + 1].pos + vertex_offset;
+    verts[thid].pos = verts[thid].pos + vertex_offset;
+    verts[thid + 1].pos = verts[thid + 1].pos + vertex_offset;
 }
