@@ -3,6 +3,12 @@ struct Globals {
     num_lights: vec4<u32>,
 };
 
+struct Vertex
+{
+    pos: vec4<f32>,
+    normal: vec4<f32>
+}
+
 @group(0)
 @binding(0)
 var<uniform> u_globals: Globals;
@@ -10,6 +16,10 @@ var<uniform> u_globals: Globals;
 @group(0)
 @binding(4)
 var<storage, read> u_spread_offsets: array<vec2<f32>>; 
+
+@group(0)
+@binding(5)
+var<storage, read> verts_vs: array<Vertex>; // write the verts
 
 struct Entity {
     world: mat4x4<f32>,
@@ -20,9 +30,12 @@ struct Entity {
 @binding(0)
 var<uniform> u_entity: Entity;
 
+const grass_vertex_count = 128;
+
 @vertex
 fn vs_bake(@location(0) position: vec4<f32>,
-    @builtin(instance_index) instance_idx: u32
+    @builtin(instance_index) instance_idx: u32,
+    @builtin(vertex_index) vertex_idx: u32
 ) -> @builtin(position) vec4<f32> {
     let spread_offset_mat = transpose(mat4x4f(
     // in x    y    z   1.0
@@ -31,7 +44,9 @@ fn vs_bake(@location(0) position: vec4<f32>,
         0.0,  0.0, 1.0, u_spread_offsets[instance_idx].y * saturate(f32(instance_idx)), 
         0.0,  0.0, 0.0, 1.0,
     ));
-    return u_globals.view_proj * u_entity.world * spread_offset_mat * vec4<f32>(position);
+    let current_vert_idx = (instance_idx * grass_vertex_count) + vertex_idx;
+
+    return u_globals.view_proj * u_entity.world * spread_offset_mat * vec4<f32>(verts_vs[current_vert_idx].pos.xyz, 1.0);
 }
 
 struct VertexOutput {
@@ -45,6 +60,7 @@ fn vs_main(
     @location(0) position: vec4<f32>,
     @location(1) normal: vec4<f32>,
     @builtin(instance_index) instance_idx: u32,
+    @builtin(vertex_index) vertex_idx: u32
 ) -> VertexOutput {
     let w = u_entity.world;
     let spread_offset_mat = transpose(mat4x4f(
@@ -54,9 +70,13 @@ fn vs_main(
             0.0,  0.0, 1.0, u_spread_offsets[instance_idx].y * saturate(f32(instance_idx)), 
             0.0,  0.0, 0.0, 1.0,
         ));
-    let world_pos = u_entity.world * spread_offset_mat * vec4<f32>(position);
+
+    let current_vert_idx = (instance_idx * grass_vertex_count) + vertex_idx;
+    let world_pos = u_entity.world * spread_offset_mat * vec4<f32>(verts_vs[current_vert_idx].pos.xyz, 1.0);
+    //let world_pos = u_entity.world * spread_offset_mat * vec4<f32>(position);
     var result: VertexOutput;
-    result.world_normal = mat3x3<f32>(w[0].xyz, w[1].xyz, w[2].xyz) * vec3<f32>(normal.xyz);
+    result.world_normal = mat3x3<f32>(w[0].xyz, w[1].xyz, w[2].xyz) * vec3<f32>(verts_vs[current_vert_idx].normal.xyz);
+    //result.world_normal = mat3x3<f32>(w[0].xyz, w[1].xyz, w[2].xyz) * vec3<f32>(normal.xyz);
     result.world_position = world_pos;
     result.proj_position = u_globals.view_proj * world_pos;
     return result;
@@ -136,12 +156,6 @@ fn fs_main_without_storage(vertex: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(color, 1.0) * u_entity.color;
 }
 
-struct Vertex
-{
-    pos: vec4<f32>,
-    normal: vec4<f32>
-}
-
 
 @group(0)
 @binding(0)
@@ -149,16 +163,21 @@ var<storage, read_write> verts: array<Vertex>; // write the verts
 @group(0)
 @binding(1)
 var<storage, read> v_entities: array<Entity>; // read the model so we can take into account where it is in the future - would need to compare pos to wind texture
+@group(1)
+@binding(0)
+var<storage, read> wind_offsets: array<vec2<f32>>; 
 
 @compute
 @workgroup_size(64, 1, 1)
 fn bezier_offset(@builtin(local_invocation_id) local_id: vec3<u32>,
-        @builtin(global_invocation_id) global_id: vec3<u32>) {
+        @builtin(global_invocation_id) global_id: vec3<u32>,
+        @builtin(workgroup_id) wgid : vec3<u32>) {
     // based on https://www.desmos.com/calculator/d1ofwre0fr
+    var wind = wind_offsets[wgid.x].x * 0.5;
     var p0 = vec2(0.0, 0.0);
-    var p1 = vec2(0.0, 0.8);
-    var p2 = vec2(0.0, 1.0);
-    var p3 = vec2(2.0, 1.0);
+    var p1 = vec2(0.0, 0.6);
+    var p2 = vec2(0.0, 1.0 - wind);
+    var p3 = vec2(1.25, 1.0);
 
     var t : f32 = f32(local_id.x) / 64.0;
 
